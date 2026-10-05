@@ -433,3 +433,11 @@ static inline bool vma_supports_mlock(const struct vm_area_struct *vma)
 {
 	return false;
 }
+
+struct mm_struct;
+
+static inline bool repl_has_pgds(struct mm_struct *mm) { return false; }
+
+static inline void repl_window_refill(struct mm_struct *mm, unsigned long start,
+				      unsigned long end) {}
+
