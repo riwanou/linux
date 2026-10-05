@@ -78,6 +78,7 @@
 #include <linux/sched/sysctl.h>
 #include <linux/pgalloc.h>
 #include <linux/uaccess.h>
+#include <linux/numa_replication.h>
 
 #include <trace/events/kmem.h>
 
@@ -245,7 +246,10 @@ static inline void free_pud_range(struct mmu_gather *tlb, p4d_t *p4d,
 		return;
 
 	pud = pud_offset(p4d, start);
-	p4d_clear(p4d);
+	if (repl_has_pgds(tlb->mm))
+		repl_p4ds_clear(tlb->mm, p4d, start);
+	else
+		p4d_clear(p4d);
 	pud_free_tlb(tlb, pud, start);
 	mm_dec_nr_puds(tlb->mm);
 }
@@ -6943,7 +6947,10 @@ int __pud_alloc(struct mm_struct *mm, p4d_t *p4d, unsigned long address)
 	if (!p4d_present(*p4d)) {
 		mm_inc_nr_puds(mm);
 		smp_wmb(); /* See comment in pmd_install() */
-		p4d_populate(mm, p4d, new);
+		if (repl_has_pgds(mm))
+			repl_p4ds_populate(mm, p4d, new, address);
+		else
+			p4d_populate(mm, p4d, new);
 	} else	/* Another has populated it */
 		pud_free(mm, new);
 	spin_unlock(&mm->page_table_lock);

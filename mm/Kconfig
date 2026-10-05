@@ -681,6 +681,15 @@ config NUMA_MIGRATION
 	  and mbind(). Selecting this option also enables support for page
 	  demotion for memory tiering.
 
+config NUMA_REPL
+	bool "NUMA replication"
+	depends on X86_64 && NUMA && MMU
+	help
+	  Replicate memory on every NUMA node for processes that opt in via
+	  /proc/<pid>/numa_repl. Each node gets its own top-level page table;
+	  mappings placed with mmap(MAP_REPL) in a reserved 512 GB window
+	  are replicated. Requires 4-level paging and no page table isolation.
+
 config MIGRATION
 	bool
 	depends on MMU

@@ -100,6 +100,7 @@
 #include <linux/ksm.h>
 #include <uapi/linux/lsm.h>
 #include <trace/events/oom.h>
+#include <linux/numa_replication.h>
 #include "internal.h"
 #include "fd.h"
 
@@ -2998,6 +2999,72 @@ static const struct file_operations proc_coredump_filter_operations = {
 };
 #endif
 
+#ifdef CONFIG_NUMA_REPL
+static ssize_t proc_numa_repl_read(struct file *file, char __user *buf,
+				   size_t count, loff_t *ppos)
+{
+	struct task_struct *task = get_proc_task(file_inode(file));
+	struct mm_struct *mm;
+	char buffer[4];
+	size_t len;
+	int ret = 0;
+
+	if (!task)
+		return -ESRCH;
+	mm = get_task_mm(task);
+	if (mm) {
+		len = snprintf(buffer, sizeof(buffer), "%d\n",
+			       mm_flags_test(MMF_NUMA_REPL, mm));
+		mmput(mm);
+		ret = simple_read_from_buffer(buf, count, ppos, buffer, len);
+	}
+	put_task_struct(task);
+	return ret;
+}
+
+static ssize_t proc_numa_repl_write(struct file *file, const char __user *buf,
+				    size_t count, loff_t *ppos)
+{
+	struct task_struct *task;
+	struct mm_struct *mm;
+	unsigned int val;
+	int ret;
+
+	ret = kstrtouint_from_user(buf, count, 0, &val);
+	if (ret < 0)
+		return ret;
+	if (val > 1)
+		return -EINVAL;
+	if (!repl_supported())
+		return -EOPNOTSUPP;
+
+	task = get_proc_task(file_inode(file));
+	if (!task)
+		return -ESRCH;
+	mm = get_task_mm(task);
+	if (!mm) {
+		put_task_struct(task);
+		return -ESRCH;
+	}
+
+	ret = count;
+	if (val)
+		mm_flags_set(MMF_NUMA_REPL, mm);
+	else if (repl_enabled(mm))
+		ret = -EPERM;		/* one-way: no switching off */
+
+	mmput(mm);
+	put_task_struct(task);
+	return ret;
+}
+
+static const struct file_operations proc_numa_repl_operations = {
+	.read		= proc_numa_repl_read,
+	.write		= proc_numa_repl_write,
+	.llseek		= generic_file_llseek,
+};
+#endif
+
 #ifdef CONFIG_TASK_IO_ACCOUNTING
 static int do_io_accounting(struct task_struct *task, struct seq_file *m, int whole)
 {
@@ -3361,6 +3428,9 @@ static const struct pid_entry tgid_base_stuff[] = {
 #endif
 #ifdef CONFIG_ELF_CORE
 	REG("coredump_filter", S_IRUGO|S_IWUSR, proc_coredump_filter_operations),
+#endif
+#ifdef CONFIG_NUMA_REPL
+	REG("numa_repl", 0644, proc_numa_repl_operations),
 #endif
 #ifdef CONFIG_TASK_IO_ACCOUNTING
 	ONE("io",	S_IRUSR, proc_tgid_io_accounting),

@@ -70,6 +70,7 @@
 #include <linux/user_events.h>
 #include <linux/rseq.h>
 #include <linux/ksm.h>
+#include <linux/numa_replication.h>
 
 #include <linux/uaccess.h>
 #include <asm/mmu_context.h>
@@ -1392,6 +1393,8 @@ void setup_new_exec(struct linux_binprm * bprm)
 	 * some architectures like powerpc
 	 */
 	me->mm->task_size = TASK_SIZE;
+	if (repl_has_pgds(me->mm))
+		repl_window_init(me->mm);
 	up_write(&me->signal->exec_update_lock);
 	mutex_unlock(&me->signal->cred_guard_mutex);
 

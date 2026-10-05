@@ -48,6 +48,7 @@
 #include <linux/sched/mm.h>
 #include <linux/ksm.h>
 #include <linux/memfd.h>
+#include <linux/numa_replication.h>
 
 #include <linux/uaccess.h>
 #include <asm/cacheflush.h>
@@ -372,6 +373,16 @@ unsigned long do_mmap(struct file *file, unsigned long addr,
 	len = PAGE_ALIGN(len);
 	if (!len)
 		return -ENOMEM;
+
+	if (repl_has_pgds(mm) && (flags & MAP_REPL) && !(flags & MAP_FIXED)) {
+		unsigned long repl_addr = repl_get_window_area(mm, len);
+
+		if (repl_addr) {
+			addr = repl_addr;
+			flags |= MAP_FIXED;
+			vma_flags_set(&vma_flags, VMA_DONTCOPY_BIT);
+		}
+	}
 
 	/* offset overflow? */
 	if ((pgoff + (len >> PAGE_SHIFT)) < pgoff)

@@ -112,6 +112,7 @@
 #include <linux/unwind_deferred.h>
 #include <linux/pgalloc.h>
 #include <linux/uaccess.h>
+#include <linux/numa_replication.h>
 
 #include <asm/mmu_context.h>
 #include <asm/cacheflush.h>
@@ -580,7 +581,10 @@ void dup_mm_exe_file(struct mm_struct *mm, struct mm_struct *oldmm)
 #ifdef CONFIG_MMU
 static inline int mm_alloc_pgd(struct mm_struct *mm)
 {
-	mm->pgd = pgd_alloc(mm);
+	if (repl_enabled(mm))
+		mm->pgd = repl_pgds_alloc(mm);
+	else
+		mm->pgd = pgd_alloc(mm);
 	if (unlikely(!mm->pgd))
 		return -ENOMEM;
 	return 0;
@@ -588,7 +592,10 @@ static inline int mm_alloc_pgd(struct mm_struct *mm)
 
 static inline void mm_free_pgd(struct mm_struct *mm)
 {
-	pgd_free(mm, mm->pgd);
+	if (repl_has_pgds(mm))
+		repl_pgds_free(mm);
+	else
+		pgd_free(mm, mm->pgd);
 }
 #else
 #define mm_alloc_pgd(mm)	(0)
@@ -1117,6 +1124,7 @@ static struct mm_struct *mm_init(struct mm_struct *mm, struct task_struct *p)
 	mm_init_uprobes_state(mm);
 	hugetlb_count_init(mm);
 	futex_mm_init(mm);
+	repl_mm_init(mm);
 
 	mm_flags_clear_all(mm);
 	if (current->mm) {
@@ -1124,6 +1132,8 @@ static struct mm_struct *mm_init(struct mm_struct *mm, struct task_struct *p)
 
 		__mm_flags_overwrite_word(mm, mmf_init_legacy_flags(flags));
 		mm->def_flags = current->mm->def_flags & VM_INIT_DEF_MASK;
+		if (repl_enabled(current->mm))
+			mm_flags_set(MMF_NUMA_REPL, mm);
 	} else {
 		__mm_flags_overwrite_word(mm, coredump_filter);
 		mm->def_flags = 0;
