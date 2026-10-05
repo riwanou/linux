@@ -26,6 +26,7 @@
 #include <linux/userfaultfd_k.h>
 #include <linux/mempolicy.h>
 #include <linux/pgalloc.h>
+#include <linux/numa_replication.h>
 
 #include <asm/cacheflush.h>
 #include <asm/tlb.h>
@@ -1856,6 +1857,10 @@ static unsigned long check_mremap_params(struct vma_remap_struct *vrm)
 	/* Start address must be page-aligned. */
 	if (offset_in_page(addr))
 		return -EINVAL;
+
+	/* mappings in the replication window cannot be mremap'd */
+	if (addr_is_replicated(current->mm, addr))
+		return -EFAULT;
 
 	/*
 	 * We allow a zero old-len as a special case

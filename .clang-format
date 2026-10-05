@@ -427,6 +427,7 @@ ForEachMacros:
   - 'for_each_reserved_child_of_node'
   - 'for_each_reserved_mem_range'
   - 'for_each_reserved_mem_region'
+  - 'for_each_repl_pgd'
   - 'for_each_rtd_ch_maps'
   - 'for_each_rtd_codec_dais'
   - 'for_each_rtd_components'

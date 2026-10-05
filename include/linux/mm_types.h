@@ -1172,6 +1172,7 @@ typedef struct {
 
 struct kioctx_table;
 struct iommu_mm_data;
+struct mm_repl;
 struct mm_struct {
 	struct {
 		/*
@@ -1200,6 +1201,9 @@ struct mm_struct {
 #endif
 		unsigned long task_size;	/* size of task vm space */
 		pgd_t * pgd;
+#ifdef CONFIG_NUMA_REPL
+		struct mm_repl *repl;
+#endif
 
 #ifdef CONFIG_MEMBARRIER
 		/**
@@ -1991,6 +1995,8 @@ enum {
 
 #define MMF_TOPDOWN		31	/* mm searches top down by default */
 #define MMF_TOPDOWN_MASK	BIT(MMF_TOPDOWN)
+
+#define MMF_NUMA_REPL		32	/* NUMA replication opted in, inherited on fork/exec */
 
 #define MMF_INIT_LEGACY_MASK	(MMF_DUMP_FILTER_MASK |\
 				 MMF_DISABLE_THP_MASK | MMF_HAS_MDWE_MASK |\

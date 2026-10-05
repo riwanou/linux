@@ -3396,8 +3396,12 @@ int __vm_munmap(unsigned long start, size_t len, bool unlock)
 
 	if (mmap_write_lock_killable(mm))
 		return -EINTR;
+	if (repl_has_pgds(mm))
+		unlock = false;
 
 	ret = do_vmi_munmap(&vmi, mm, start, len, &uf, unlock);
+	if (!ret && repl_has_pgds(mm))
+		repl_window_refill(mm, start, start + PAGE_ALIGN(len));
 	if (ret || !unlock)
 		mmap_write_unlock(mm);
 
