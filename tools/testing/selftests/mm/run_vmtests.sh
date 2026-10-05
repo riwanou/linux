@@ -93,6 +93,8 @@ separated by spaces:
 	test rmap behaves as expected
 - memory-failure
 	test memory-failure behaves as expected
+- numa_replication
+	test NUMA replication patch
 
 example: ./run_vmtests.sh -t "hmm mmap ksm"
 EOF
@@ -461,6 +463,8 @@ CATEGORY="page_frag" run_test ./test_page_frag.sh nonaligned
 CATEGORY="rmap" run_test ./rmap
 
 CATEGORY="memory-failure" run_test ./memory-failure
+
+CATEGORY="numa_replication" run_test ./numa_replication
 
 echo "SUMMARY: PASS=${count_pass} SKIP=${count_skip} FAIL=${count_fail}" | tap_prefix
 echo "1..${count_total}" | tap_output
