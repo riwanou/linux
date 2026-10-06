@@ -3051,7 +3051,7 @@ static ssize_t proc_numa_repl_write(struct file *file, const char __user *buf,
 	if (val)
 		mm_flags_set(MMF_NUMA_REPL, mm);
 	else if (repl_enabled(mm))
-		ret = -EPERM;		/* one-way: no switching off */
+		ret = -EPERM; /* one-way: no switching off */
 
 	mmput(mm);
 	put_task_struct(task);
@@ -3059,10 +3059,22 @@ static ssize_t proc_numa_repl_write(struct file *file, const char __user *buf,
 }
 
 static const struct file_operations proc_numa_repl_operations = {
-	.read		= proc_numa_repl_read,
-	.write		= proc_numa_repl_write,
-	.llseek		= generic_file_llseek,
+	.read = proc_numa_repl_read,
+	.write = proc_numa_repl_write,
+	.llseek = generic_file_llseek,
 };
+
+static int proc_numa_repl_stat(struct seq_file *m, struct pid_namespace *ns,
+			       struct pid *pid, struct task_struct *task)
+{
+	struct mm_struct *mm = get_task_mm(task);
+
+	if (!mm)
+		return 0;
+	repl_stat_show(m, mm);
+	mmput(mm);
+	return 0;
+}
 #endif
 
 #ifdef CONFIG_TASK_IO_ACCOUNTING
@@ -3431,6 +3443,7 @@ static const struct pid_entry tgid_base_stuff[] = {
 #endif
 #ifdef CONFIG_NUMA_REPL
 	REG("numa_repl", 0644, proc_numa_repl_operations),
+	ONE("numa_repl_stat", 0400, proc_numa_repl_stat),
 #endif
 #ifdef CONFIG_TASK_IO_ACCOUNTING
 	ONE("io",	S_IRUSR, proc_tgid_io_accounting),

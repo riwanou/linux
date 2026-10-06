@@ -13,6 +13,7 @@
 struct mm_repl {
 	nodemask_t nodes;
 	pgd_t *pgds[REPL_MAX_NODES];
+	int main_nid;
 	unsigned long window; /* 512GB, 1 PGD */
 };
 
@@ -55,16 +56,30 @@ void repl_pgds_free(struct mm_struct *mm);
 void repl_p4ds_populate(struct mm_struct *mm, p4d_t *p4d, pud_t *pud,
 			unsigned long address);
 void repl_p4ds_clear(struct mm_struct *mm, p4d_t *p4d, unsigned long address);
+void repl_free_p4d_range(struct mmu_gather *tlb, unsigned long addr,
+			 unsigned long end, unsigned long floor,
+			 unsigned long ceiling);
 
 void repl_window_init(struct mm_struct *mm);
 void repl_window_refill(struct mm_struct *mm, unsigned long start,
 			unsigned long end);
 unsigned long repl_get_window_area(struct mm_struct *mm, unsigned long len);
+bool repl_mmap_eligible(struct mm_struct *mm, struct file *file,
+			unsigned long flags);
 static inline bool addr_is_replicated(struct mm_struct *mm, unsigned long addr)
 {
 	return mm->repl && mm->repl->window &&
 	       addr - mm->repl->window < PGDIR_SIZE;
 }
+
+bool repl_zap_replicas(struct mmu_gather *tlb, struct vm_area_struct *vma,
+		       unsigned long addr, pte_t *mainp);
+
+vm_fault_t repl_handle_mm_fault(struct vm_area_struct *vma,
+				unsigned long address, unsigned int flags);
+
+struct seq_file;
+void repl_stat_show(struct seq_file *m, struct mm_struct *mm);
 #else
 /* clang-format off */
 static inline bool repl_supported(void) { return false; }
@@ -78,11 +93,22 @@ static inline void repl_pgds_free(struct mm_struct *mm) {}
 static inline void repl_p4ds_populate(struct mm_struct *mm, p4d_t *p4d, pud_t *pud,
 			unsigned long address) {}
 static inline void repl_p4ds_clear(struct mm_struct *mm, p4d_t *p4d, unsigned long address) {}
+static inline void repl_free_p4d_range(struct mmu_gather *tlb, unsigned long addr,
+			 unsigned long end, unsigned long floor,
+			 unsigned long ceiling) {}
 static inline void repl_window_init(struct mm_struct *mm) {}
 static inline void repl_window_refill(struct mm_struct *mm, unsigned long start,
 			unsigned long end) {}
+static inline bool repl_mmap_eligible(struct mm_struct *mm, struct file *file,
+			unsigned long flags) { return false; }
 static inline unsigned long repl_get_window_area(struct mm_struct *mm, unsigned long len) { return 0; }
 static inline bool addr_is_replicated(struct mm_struct *mm, unsigned long addr) { return false; }
+
+static inline bool repl_zap_replicas(struct mmu_gather *tlb, struct vm_area_struct *vma,
+		       unsigned long addr, pte_t *mainp) { return false; }
+
+static inline vm_fault_t repl_handle_mm_fault(struct vm_area_struct *vma,
+				unsigned long address, unsigned int flags) { return 0; }
 /* clang-format on */
 #endif
 

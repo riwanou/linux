@@ -579,6 +579,16 @@ bool __folio_end_writeback(struct folio *folio);
 void deactivate_file_folio(struct folio *folio);
 void folio_activate(struct folio *folio);
 
+vm_fault_t do_pte_missing(struct vm_fault *vmf);
+vm_fault_t do_page_mkwrite(struct vm_fault *vmf, struct folio *folio);
+vm_fault_t fault_dirty_shared_page(struct vm_fault *vmf);
+vm_fault_t vmf_can_call_fault(const struct vm_fault *vmf);
+gfp_t __get_fault_gfp_mask(struct vm_area_struct *vma);
+
+void free_p4d_range(struct mmu_gather *tlb, pgd_t *pgd,
+				unsigned long addr, unsigned long end,
+				unsigned long floor, unsigned long ceiling);
+
 void free_pgtables(struct mmu_gather *tlb, struct unmap_desc *desc);
 
 void pmd_install(struct mm_struct *mm, pmd_t *pmd, pgtable_t *pte);
