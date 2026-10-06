@@ -254,7 +254,7 @@ static inline void free_pud_range(struct mmu_gather *tlb, p4d_t *p4d,
 	mm_dec_nr_puds(tlb->mm);
 }
 
-static inline void free_p4d_range(struct mmu_gather *tlb, pgd_t *pgd,
+void free_p4d_range(struct mmu_gather *tlb, pgd_t *pgd,
 				unsigned long addr, unsigned long end,
 				unsigned long floor, unsigned long ceiling)
 {
@@ -357,7 +357,10 @@ void free_pgd_range(struct mmu_gather *tlb,
 		next = pgd_addr_end(addr, end);
 		if (pgd_none_or_clear_bad(pgd))
 			continue;
-		free_p4d_range(tlb, pgd, addr, next, floor, ceiling);
+		if (repl_has_pgds(tlb->mm) && addr_is_replicated(tlb->mm, addr))
+			repl_free_p4d_range(tlb, addr, next, floor, ceiling);
+		else
+			free_p4d_range(tlb, pgd, addr, next, floor, ceiling);
 	} while (pgd++, addr = next, addr != end);
 }
 
@@ -1832,6 +1835,11 @@ static inline int zap_present_ptes(struct mmu_gather *tlb,
 	struct page *page;
 	int nr;
 
+	if (addr_is_replicated(mm, addr)) {
+		max_nr = 1;	/* replicas are zapped one address at a time */
+		if (repl_zap_replicas(tlb, vma, addr, pte))
+			*force_flush = *force_break = true;
+	}
 	page = vm_normal_page(vma, addr, ptent);
 	if (!page) {
 		/* We don't need up-to-date accessed/dirty bits. */
@@ -3786,7 +3794,7 @@ pte_unlock:
 	return ret;
 }
 
-static gfp_t __get_fault_gfp_mask(struct vm_area_struct *vma)
+gfp_t __get_fault_gfp_mask(struct vm_area_struct *vma)
 {
 	struct file *vm_file = vma->vm_file;
 
@@ -3806,7 +3814,7 @@ static gfp_t __get_fault_gfp_mask(struct vm_area_struct *vma)
  *
  * We do this without the lock held, so that it can sleep if it needs to.
  */
-static vm_fault_t do_page_mkwrite(struct vm_fault *vmf, struct folio *folio)
+vm_fault_t do_page_mkwrite(struct vm_fault *vmf, struct folio *folio)
 {
 	vm_fault_t ret;
 	unsigned int old_flags = vmf->flags;
@@ -3839,7 +3847,7 @@ static vm_fault_t do_page_mkwrite(struct vm_fault *vmf, struct folio *folio)
  *
  * The function expects the page to be locked and unlocks it.
  */
-static vm_fault_t fault_dirty_shared_page(struct vm_fault *vmf)
+vm_fault_t fault_dirty_shared_page(struct vm_fault *vmf)
 {
 	struct vm_area_struct *vma = vmf->vma;
 	struct address_space *mapping;
@@ -3926,7 +3934,7 @@ static inline void wp_page_reuse(struct vm_fault *vmf, struct folio *folio)
  * vm_ops that have a ->map_pages have been audited and don't need
  * the mmap_lock to be held.
  */
-static inline vm_fault_t vmf_can_call_fault(const struct vm_fault *vmf)
+vm_fault_t vmf_can_call_fault(const struct vm_fault *vmf)
 {
 	struct vm_area_struct *vma = vmf->vma;
 
@@ -4696,7 +4704,7 @@ static vm_fault_t pte_marker_clear(struct vm_fault *vmf)
 	return 0;
 }
 
-static vm_fault_t do_pte_missing(struct vm_fault *vmf)
+vm_fault_t do_pte_missing(struct vm_fault *vmf)
 {
 	if (vma_is_anonymous(vmf->vma))
 		return do_anonymous_page(vmf);
@@ -6876,6 +6884,8 @@ vm_fault_t handle_mm_fault(struct vm_area_struct *vma, unsigned long address,
 
 	if (unlikely(is_vm_hugetlb_page(vma)))
 		ret = hugetlb_fault(vma->vm_mm, vma, address, flags);
+	else if (addr_is_replicated(vma->vm_mm, address))
+		ret = repl_handle_mm_fault(vma, address, flags);
 	else
 		ret = __handle_mm_fault(vma, address, flags);
 

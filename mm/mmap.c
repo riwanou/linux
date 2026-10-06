@@ -374,13 +374,14 @@ unsigned long do_mmap(struct file *file, unsigned long addr,
 	if (!len)
 		return -ENOMEM;
 
-	if (repl_has_pgds(mm) && (flags & MAP_REPL) && !(flags & MAP_FIXED)) {
+	if (repl_mmap_eligible(mm, file, flags)) {
 		unsigned long repl_addr = repl_get_window_area(mm, len);
 
 		if (repl_addr) {
 			addr = repl_addr;
 			flags |= MAP_FIXED;
 			vma_flags_set(&vma_flags, VMA_DONTCOPY_BIT);
+			vma_flags_set(&vma_flags, VMA_NOHUGEPAGE_BIT);
 		}
 	}
 

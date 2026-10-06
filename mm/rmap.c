@@ -75,6 +75,7 @@
 #include <linux/userfaultfd_k.h>
 #include <linux/mm_inline.h>
 #include <linux/oom.h>
+#include <linux/numa_replication.h>
 
 #include <asm/tlb.h>
 
@@ -1492,7 +1493,10 @@ static void __folio_set_anon(struct folio *folio, struct vm_area_struct *vma,
 	 */
 	anon_vma = (void *) anon_vma + FOLIO_MAPPING_ANON;
 	WRITE_ONCE(folio->mapping, (struct address_space *) anon_vma);
-	folio->index = linear_anon_page_index(vma, address);
+	if (addr_is_replicated(vma->vm_mm, address))
+		folio->index = __linear_anon_page_index(vma, address);
+	else
+		folio->index = linear_anon_page_index(vma, address);
 }
 
 /**
