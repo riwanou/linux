@@ -466,6 +466,8 @@ CATEGORY="memory-failure" run_test ./memory-failure
 
 CATEGORY="numa_replication" run_test ./numa_replication
 
+CATEGORY="numa_replication" run_test ./numa_replication_fault
+
 echo "SUMMARY: PASS=${count_pass} SKIP=${count_skip} FAIL=${count_fail}" | tap_prefix
 echo "1..${count_total}" | tap_output
 

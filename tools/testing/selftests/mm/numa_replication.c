@@ -1,36 +1,15 @@
 // SPDX-License-Identifier: GPL-2.0
 /* NUMA replication opt-in: /proc/self/numa_repl */
 
-#include <errno.h>
-#include <fcntl.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
 #include <stdio.h>
 #include <sys/mman.h>
 #include <sys/wait.h>
-#include "kselftest.h"
 
-#define WINDOW_SIZE (1UL << 39) /* one PGD entry, 4-level paging */
-static unsigned long window;
-
-#ifndef MAP_REPL
-#define MAP_REPL 0x200000
-#endif
+#include "numa_replication_util.h"
 
 #define SZ (2UL << 20)
-
-static int repl_write(const char *v)
-{
-	int fd = open("/proc/self/numa_repl", O_WRONLY);
-	int ret;
-
-	if (fd < 0)
-		return -errno;
-	ret = write(fd, v, strlen(v)) < 0 ? -errno : 0;
-	close(fd);
-	return ret;
-}
+#define WINDOW_SIZE (1UL << 39) /* one PGD entry, 4-level paging */
+static unsigned long window;
 
 /* end of the [repl] piece containing addr, 0 if none */
 static unsigned long placeholder_at(unsigned long addr)
@@ -177,10 +156,29 @@ static void test_mremap_refused(void)
 	munmap((void *)a, SZ);
 }
 
+static void test_eligible(void)
+{
+	int fd = test_file(SZ);
+	unsigned long anon = mmap_repl(SZ);
+	unsigned long shared = (unsigned long)mmap(
+		NULL, SZ, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_REPL, fd, 0);
+	unsigned long priv = (unsigned long)mmap(NULL, SZ,
+						 PROT_READ | PROT_WRITE,
+						 MAP_PRIVATE | MAP_REPL, fd, 0);
+
+	vma_result(
+		in_window(anon) && in_window(shared) && !in_window(priv),
+		"private anon and shared file in window, private file out\n");
+	munmap((void *)anon, SZ);
+	munmap((void *)shared, SZ);
+	munmap((void *)priv, SZ);
+	close(fd);
+}
+
 static void (*tests[])(void) = {
 	test_cannot_opt_out, test_window_aligned,  test_hint_lands_outside,
 	test_fork,	     test_repl_contiguous, test_hole,
-	test_holes_merge,    test_mremap_refused,
+	test_holes_merge,    test_mremap_refused,  test_eligible,
 };
 
 int main(int argc, char **argv)
@@ -188,14 +186,7 @@ int main(int argc, char **argv)
 	unsigned long w;
 	int i;
 
-	if (!getenv("NUMA_REPL_EXECED")) {
-		if (repl_write("1"))
-			ksft_exit_skip("NUMA replication not available\n");
-		setenv("NUMA_REPL_EXECED", "1", 1);
-		execv("/proc/self/exe", argv);
-		ksft_exit_fail_msg("execv: %s\n", strerror(errno));
-	}
-
+	repl_reexec(argv);
 	ksft_print_header();
 	for (w = 0; w < (128UL << 40); w += WINDOW_SIZE)
 		if (placeholder_at(w))

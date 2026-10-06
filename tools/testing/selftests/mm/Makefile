@@ -105,6 +105,7 @@ TEST_GEN_FILES += merge
 TEST_GEN_FILES += rmap
 TEST_GEN_FILES += folio_split_race_test
 TEST_GEN_FILES += numa_replication
+TEST_GEN_FILES += numa_replication_fault
 
 ifneq ($(ARCH),arm64)
 TEST_GEN_FILES += soft-dirty
