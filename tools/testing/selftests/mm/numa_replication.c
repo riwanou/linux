@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: GPL-2.0
-/* NUMA replication opt-in: /proc/self/numa_repl */
 
 #include <stdio.h>
 #include <sys/mman.h>
@@ -65,6 +64,20 @@ static unsigned long mmap_repl(size_t len)
 static int in_window(unsigned long p)
 {
 	return p >= window && p < window + WINDOW_SIZE;
+}
+
+static int child_mmap(int fd)
+{
+	int status;
+	pid_t pid = fork();
+	void *p;
+
+	if (pid == 0) {
+		p = mmap(NULL, SZ, PROT_READ, MAP_SHARED, fd, 0);
+		_exit(p == MAP_FAILED ? errno : in_window((unsigned long)p));
+	}
+	waitpid(pid, &status, 0);
+	return WEXITSTATUS(status);
 }
 
 static void test_cannot_opt_out(void)
@@ -158,13 +171,13 @@ static void test_mremap_refused(void)
 
 static void test_eligible(void)
 {
-	int fd = test_file(SZ);
+	int fd = test_file(SZ), priv_fd = test_file(SZ);
 	unsigned long anon = mmap_repl(SZ);
 	unsigned long shared = (unsigned long)mmap(
 		NULL, SZ, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_REPL, fd, 0);
-	unsigned long priv = (unsigned long)mmap(NULL, SZ,
-						 PROT_READ | PROT_WRITE,
-						 MAP_PRIVATE | MAP_REPL, fd, 0);
+	unsigned long priv =
+		(unsigned long)mmap(NULL, SZ, PROT_READ | PROT_WRITE,
+				    MAP_PRIVATE | MAP_REPL, priv_fd, 0);
 
 	vma_result(
 		in_window(anon) && in_window(shared) && !in_window(priv),
@@ -173,12 +186,68 @@ static void test_eligible(void)
 	munmap((void *)shared, SZ);
 	munmap((void *)priv, SZ);
 	close(fd);
+	close(priv_fd);
+}
+
+static void test_registered(void)
+{
+	const char *files = "/sys/kernel/mm/numa_replication/files";
+	unsigned long in, out;
+	char path[256];
+	int fd;
+
+	snprintf(path, sizeof(path), "%s/repl_registered",
+		 getenv("REPL_TEST_DIR") ?: "/tmp");
+	fd = open(path, O_CREAT | O_RDWR | O_TRUNC, 0600);
+	ftruncate(fd, SZ);
+
+	write_file(files, "repl_registered");
+	in = (unsigned long)mmap(NULL, SZ, PROT_READ | PROT_WRITE, MAP_SHARED,
+				 fd, 0);
+	munmap((void *)in, SZ);
+	write_file(files, "\n");
+	out = (unsigned long)mmap(NULL, SZ, PROT_READ | PROT_WRITE, MAP_SHARED,
+				  fd, 0);
+
+	vma_result(in_window(in) && !in_window(out),
+		   "a registered file goes in the window without MAP_REPL\n");
+	munmap((void *)out, SZ);
+	close(fd);
+	unlink(path);
+}
+
+static void test_file_alone(void)
+{
+	int fd = test_file(SZ), outside, busy, plain;
+	void *first, *repl, *other;
+
+	first = mmap(NULL, SZ, PROT_READ, MAP_SHARED, fd, 0);
+	repl = mmap(NULL, SZ, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_REPL, fd,
+		    0);
+	outside = repl != MAP_FAILED && !in_window((unsigned long)repl);
+	munmap(repl, SZ);
+	munmap(first, SZ);
+
+	repl = mmap(NULL, SZ, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_REPL, fd,
+		    0);
+	other = mmap(NULL, SZ, PROT_READ, MAP_PRIVATE, fd, 0);
+	if (other != MAP_FAILED)
+		munmap(other, SZ);
+	busy = child_mmap(fd) == EBUSY;
+	munmap(repl, SZ);
+	plain = child_mmap(fd) == 0;
+
+	vma_result(outside && in_window((unsigned long)repl) &&
+			   other == MAP_FAILED && busy && plain,
+		   "a file in the window is its only mapping\n");
+	close(fd);
 }
 
 static void (*tests[])(void) = {
 	test_cannot_opt_out, test_window_aligned,  test_hint_lands_outside,
 	test_fork,	     test_repl_contiguous, test_hole,
 	test_holes_merge,    test_mremap_refused,  test_eligible,
+	test_registered,     test_file_alone,
 };
 
 int main(int argc, char **argv)

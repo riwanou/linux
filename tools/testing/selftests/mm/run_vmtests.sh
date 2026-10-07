@@ -468,6 +468,8 @@ CATEGORY="numa_replication" run_test ./numa_replication
 
 CATEGORY="numa_replication" run_test ./numa_replication_fault
 
+CATEGORY="numa_replication" run_test ./numa_replication_mm
+
 echo "SUMMARY: PASS=${count_pass} SKIP=${count_skip} FAIL=${count_fail}" | tap_prefix
 echo "1..${count_total}" | tap_output
 
