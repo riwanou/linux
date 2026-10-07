@@ -18,6 +18,7 @@
 #include <linux/swap.h>
 #include <linux/leafops.h>
 #include <linux/tracepoint-defs.h>
+#include <linux/numa_replication.h>
 
 /* Internal core VMA manipulation functions. */
 #include "vma.h"
@@ -1078,7 +1079,8 @@ static inline unsigned long vma_filebacked_address(const struct vm_area_struct *
 static inline unsigned long vma_anon_address(const struct vm_area_struct *vma,
 		pgoff_t pgoff_anon, unsigned long nr_pages)
 {
-	VM_WARN_ON_ONCE(!vma_is_cow_mapping(vma));
+	VM_WARN_ON_ONCE(!vma_is_cow_mapping(vma) &&
+			!addr_is_replicated(vma->vm_mm, vma->vm_start));
 
 	return __vma_address(vma, pgoff_anon, vma_start_anon_pgoff(vma), nr_pages);
 }

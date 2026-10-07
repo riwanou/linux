@@ -1140,6 +1140,8 @@ static int page_vma_mkclean_one(struct page_vma_mapped_walk *pvmw)
 			 */
 			if (!pte_present(entry))
 				continue;
+			if (addr_is_replicated(vma->vm_mm, address))
+				repl_mkclean_main(vma, address, pte);
 			if (!pte_dirty(entry) && !pte_write(entry))
 				continue;
 
@@ -1967,6 +1969,8 @@ static inline unsigned int folio_unmap_pte_batch(struct folio *folio,
 		return 1;
 	if (!folio_test_large(folio))
 		return 1;
+	if (addr_is_replicated(vma->vm_mm, addr))
+		return 1;
 
 	/* We may only batch within a single VMA and a single page table. */
 	end_addr = pmd_addr_end(addr, vma->vm_end);
@@ -2325,6 +2329,8 @@ static bool try_to_unmap_one(struct folio *folio, struct vm_area_struct *vma,
 		}
 
 		page = folio_page(folio, pfn - folio_pfn(folio));
+		if (addr_is_replicated(mm, address))
+			repl_unmap_main(vma, address, pvmw.pte, false);
 
 		if (likely(pte_present(pteval))) {
 			nr_pages = folio_unmap_pte_batch(folio, &pvmw, flags, pteval);
@@ -2578,6 +2584,8 @@ static bool try_to_migrate_one(struct folio *folio, struct vm_area_struct *vma,
 		}
 
 		subpage = folio_page(folio, pfn - folio_pfn(folio));
+		if (addr_is_replicated(mm, address))
+			repl_unmap_main(vma, address, pvmw.pte, true);
 		anon_exclusive = folio_test_anon(folio) &&
 				 PageAnonExclusive(subpage);
 

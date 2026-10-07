@@ -66,6 +66,7 @@ void repl_window_refill(struct mm_struct *mm, unsigned long start,
 unsigned long repl_get_window_area(struct mm_struct *mm, unsigned long len);
 bool repl_mmap_eligible(struct mm_struct *mm, struct file *file,
 			unsigned long flags);
+bool repl_file_replicated(struct file *file, unsigned long flags);
 static inline bool addr_is_replicated(struct mm_struct *mm, unsigned long addr)
 {
 	return mm->repl && mm->repl->window &&
@@ -74,6 +75,16 @@ static inline bool addr_is_replicated(struct mm_struct *mm, unsigned long addr)
 
 bool repl_zap_replicas(struct mmu_gather *tlb, struct vm_area_struct *vma,
 		       unsigned long addr, pte_t *mainp);
+void repl_unmap_main(struct vm_area_struct *vma, unsigned long addr,
+		     pte_t *mainp, bool shared_only);
+pte_t repl_migrate_done(struct vm_area_struct *vma, unsigned long addr,
+			pte_t pte, bool writable);
+void repl_mkclean_main(struct vm_area_struct *vma, unsigned long addr,
+		       pte_t *mainp);
+
+void repl_sync_folio(struct folio *folio);
+void repl_invalidate_folio(struct folio *folio);
+void repl_read_folio(struct folio *folio);
 
 vm_fault_t repl_handle_mm_fault(struct vm_area_struct *vma,
 				unsigned long address, unsigned int flags);
@@ -102,10 +113,21 @@ static inline void repl_window_refill(struct mm_struct *mm, unsigned long start,
 static inline bool repl_mmap_eligible(struct mm_struct *mm, struct file *file,
 			unsigned long flags) { return false; }
 static inline unsigned long repl_get_window_area(struct mm_struct *mm, unsigned long len) { return 0; }
+static inline bool repl_file_replicated(struct file *file, unsigned long flags) { return false; }
 static inline bool addr_is_replicated(struct mm_struct *mm, unsigned long addr) { return false; }
 
 static inline bool repl_zap_replicas(struct mmu_gather *tlb, struct vm_area_struct *vma,
 		       unsigned long addr, pte_t *mainp) { return false; }
+static inline void repl_unmap_main(struct vm_area_struct *vma, unsigned long addr,
+		     pte_t *mainp, bool shared_only) {}
+static inline pte_t repl_migrate_done(struct vm_area_struct *vma,
+		unsigned long addr, pte_t pte, bool writable) { return pte; }
+static inline void repl_mkclean_main(struct vm_area_struct *vma, unsigned long addr,
+		       pte_t *mainp) {}
+
+static inline void repl_sync_folio(struct folio *folio) {}
+static inline void repl_invalidate_folio(struct folio *folio) {}
+static inline void repl_read_folio(struct folio *folio) {}
 
 static inline vm_fault_t repl_handle_mm_fault(struct vm_area_struct *vma,
 				unsigned long address, unsigned int flags) { return 0; }

@@ -54,6 +54,13 @@ DEFINE_REPL_REMOTE_EVENT(repl_main_swapin);
 DEFINE_REPL_REMOTE_EVENT(repl_main_zap);
 DEFINE_REPL_REMOTE_EVENT(repl_invalidate);
 DEFINE_REPL_REMOTE_EVENT(repl_free);
+DEFINE_REPL_REMOTE_EVENT(repl_migrated);
+DEFINE_REPL_REMOTE_EVENT(repl_mkclean);
+DEFINE_REPL_REMOTE_EVENT(repl_sync);
+DEFINE_REPL_REMOTE_EVENT(repl_written);
+DEFINE_REPL_REMOTE_EVENT(repl_unmap);
+DEFINE_REPL_REMOTE_EVENT(repl_unmap_shared);
+DEFINE_REPL_REMOTE_EVENT(repl_unshare);
 
 TRACE_EVENT(repl_copy,
 	TP_PROTO(unsigned long addr, unsigned long src, unsigned long dst),
