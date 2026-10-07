@@ -7,6 +7,7 @@
 
 LOCAL_HDRS += $(selfdir)/mm/local_config.h_gen $(top_srcdir)/mm/gup_test.h
 LOCAL_HDRS += $(selfdir)/mm/mseal_helpers.h
+LOCAL_HDRS += $(selfdir)/mm/numa_replication_util.h
 
 include local_config.mk
 
@@ -106,6 +107,7 @@ TEST_GEN_FILES += rmap
 TEST_GEN_FILES += folio_split_race_test
 TEST_GEN_FILES += numa_replication
 TEST_GEN_FILES += numa_replication_fault
+TEST_GEN_FILES += numa_replication_mm
 
 ifneq ($(ARCH),arm64)
 TEST_GEN_FILES += soft-dirty
