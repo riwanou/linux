@@ -52,6 +52,7 @@
 #include <linux/ratelimit.h>
 #include <linux/task_work.h>
 #include <linux/rbtree_augmented.h>
+#include <linux/numa_replication.h>
 
 #include <asm/switch_to.h>
 
@@ -4416,6 +4417,8 @@ retry_pids:
 	}
 
 	for (; vma; vma = vma_next(&vmi)) {
+		if (addr_is_replicated(mm, vma->vm_start))
+			continue;
 		if (!vma_migratable(vma) || !vma_policy_mof(vma) ||
 			is_vm_hugetlb_page(vma) || (vma->vm_flags & VM_MIXEDMAP)) {
 			trace_sched_skip_vma_numa(mm, vma, NUMAB_SKIP_UNSUITABLE);

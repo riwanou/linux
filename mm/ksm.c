@@ -2686,7 +2686,8 @@ next_mm:
 		goto no_vmas;
 
 	for_each_vma(vmi, vma) {
-		if (!(vma->vm_flags & VM_MERGEABLE))
+		if (!(vma->vm_flags & VM_MERGEABLE) ||
+		    addr_is_replicated(mm, vma->vm_start))
 			continue;
 		if (ksm_scan.address < vma->vm_start)
 			ksm_scan.address = vma->vm_start;

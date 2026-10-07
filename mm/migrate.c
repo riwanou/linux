@@ -43,6 +43,7 @@
 #include <linux/sched/sysctl.h>
 #include <linux/memory-tiers.h>
 #include <linux/pagewalk.h>
+#include <linux/numa_replication.h>
 
 #include <asm/tlbflush.h>
 
@@ -405,6 +406,10 @@ static bool remove_migration_pte(struct folio *folio,
 		/* See do_swap_page(): restore PAGE_NONE for RWP */
 		if (pte_swp_uffd(old_pte) && userfaultfd_rwp(vma))
 			pte = pte_modify(pte, PAGE_NONE);
+
+		if (addr_is_replicated(vma->vm_mm, pvmw.address))
+			pte = repl_migrate_done(vma, pvmw.address, pte,
+							softleaf_is_migration_write(entry));
 
 		if (folio_test_anon(folio) && !softleaf_is_migration_read(entry))
 			rmap_flags |= RMAP_EXCLUSIVE;

@@ -49,6 +49,7 @@
 #include <linux/sched/mm.h>
 #include <linux/sysctl.h>
 #include <linux/pgalloc.h>
+#include <linux/numa_replication.h>
 
 #include <asm/tlbflush.h>
 #include "internal.h"
@@ -2869,8 +2870,10 @@ ssize_t filemap_read(struct kiocb *iocb, struct iov_iter *iter,
 			 * virtual addresses, take care of potential aliasing
 			 * before reading the folio on the kernel side.
 			 */
-			if (writably_mapped)
+			if (writably_mapped) {
 				flush_dcache_folio(folio);
+				repl_read_folio(folio);
+			}
 
 			copied = copy_folio_to_iter(folio, offset, bytes, iter);
 
@@ -3136,8 +3139,10 @@ ssize_t filemap_splice_read(struct file *in, loff_t *ppos,
 			 * virtual addresses, take care of potential aliasing
 			 * before reading the folio on the kernel side.
 			 */
-			if (writably_mapped)
+			if (writably_mapped) {
 				flush_dcache_folio(folio);
+				repl_read_folio(folio);
+			}
 
 			n = min_t(loff_t, len, isize - *ppos);
 			n = splice_folio_into_pipe(pipe, folio, *ppos, n);
@@ -4382,6 +4387,7 @@ retry:
 
 		if (mapping_writably_mapped(mapping))
 			flush_dcache_folio(folio);
+		repl_sync_folio(folio);
 
 		/*
 		 * Faults here on mmap()s can recurse into arbitrary
@@ -4391,6 +4397,7 @@ retry:
 		 */
 		copied = copy_folio_from_iter_atomic(folio, offset, bytes, i);
 		flush_dcache_folio(folio);
+		repl_invalidate_folio(folio);
 
 		status = a_ops->write_end(iocb, mapping, pos, bytes, copied,
 						folio, fsdata);

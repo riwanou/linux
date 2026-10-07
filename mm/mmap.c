@@ -384,6 +384,8 @@ unsigned long do_mmap(struct file *file, unsigned long addr,
 			vma_flags_set(&vma_flags, VMA_NOHUGEPAGE_BIT);
 		}
 	}
+	if (file && repl_file_replicated(file, flags))
+		return -EBUSY;
 
 	/* offset overflow? */
 	if ((pgoff + (len >> PAGE_SHIFT)) < pgoff)
