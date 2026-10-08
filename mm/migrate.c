@@ -408,8 +408,9 @@ static bool remove_migration_pte(struct folio *folio,
 			pte = pte_modify(pte, PAGE_NONE);
 
 		if (addr_is_replicated(vma->vm_mm, pvmw.address))
-			pte = repl_migrate_done(vma, pvmw.address, pte,
-							softleaf_is_migration_write(entry));
+			pte = repl_migrate_done(
+				vma, pvmw.address, pte, softleaf_to_pfn(entry),
+				softleaf_is_migration_write(entry));
 
 		if (folio_test_anon(folio) && !softleaf_is_migration_read(entry))
 			rmap_flags |= RMAP_EXCLUSIVE;

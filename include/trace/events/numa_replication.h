@@ -54,15 +54,17 @@ DEFINE_REPL_REMOTE_EVENT(repl_main_swapin);
 DEFINE_REPL_REMOTE_EVENT(repl_main_zap);
 DEFINE_REPL_REMOTE_EVENT(repl_invalidate);
 DEFINE_REPL_REMOTE_EVENT(repl_free);
-DEFINE_REPL_REMOTE_EVENT(repl_migrated);
+DEFINE_REPL_REMOTE_EVENT(repl_migrate_start);
 DEFINE_REPL_REMOTE_EVENT(repl_mkclean);
 DEFINE_REPL_REMOTE_EVENT(repl_sync);
+DEFINE_REPL_REMOTE_EVENT(repl_wrprotect);
 DEFINE_REPL_REMOTE_EVENT(repl_written);
-DEFINE_REPL_REMOTE_EVENT(repl_unmap);
-DEFINE_REPL_REMOTE_EVENT(repl_unmap_shared);
+DEFINE_REPL_REMOTE_EVENT(repl_referenced);
+DEFINE_REPL_REMOTE_EVENT(repl_unmap_main);
+DEFINE_REPL_REMOTE_EVENT(repl_unmap_replica);
 DEFINE_REPL_REMOTE_EVENT(repl_unshare);
 
-TRACE_EVENT(repl_copy,
+DECLARE_EVENT_CLASS(repl_move,
 	TP_PROTO(unsigned long addr, unsigned long src, unsigned long dst),
 	TP_ARGS(addr, src, dst),
 	TP_STRUCT__entry(
@@ -85,6 +87,13 @@ TRACE_EVENT(repl_copy,
 		  __entry->addr, __entry->src, __entry->src_node,
 		  __entry->dst, __entry->dst_node)
 );
+
+DEFINE_EVENT(repl_move, repl_copy,
+	TP_PROTO(unsigned long addr, unsigned long src, unsigned long dst),
+	TP_ARGS(addr, src, dst));
+DEFINE_EVENT(repl_move, repl_migrate_done,
+	TP_PROTO(unsigned long addr, unsigned long src, unsigned long dst),
+	TP_ARGS(addr, src, dst));
 /* clang-format on */
 
 #endif

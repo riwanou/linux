@@ -6,6 +6,7 @@
 #include <linux/mempolicy.h>
 #include <linux/mman.h>
 #include <linux/seq_file.h>
+#include <linux/migrate.h>
 
 #include <asm/pgalloc.h>
 #include <asm/tlb.h>
@@ -16,7 +17,7 @@
 #include <trace/events/numa_replication.h>
 
 struct repl_stat {
-	unsigned long w, r, s, dirty, local, shared;
+	unsigned long w, r, s, dirty, young, local, shared;
 };
 
 struct repl_stats {
@@ -28,9 +29,14 @@ struct repl_stats {
 static struct mempolicy repl_preferred_policy[REPL_MAX_NODES];
 static struct mempolicy repl_bind_policy[REPL_MAX_NODES];
 
-enum { REPL_MAIN_BOUND, REPL_MAIN_FIRST_TOUCH, REPL_MAIN_INTERLEAVE };
+enum {
+	REPL_MAIN_BOUND,
+	REPL_MAIN_FIRST_TOUCH,
+	REPL_MAIN_INTERLEAVE,
+	REPL_MAIN_DYNAMIC
+};
 static const char *const repl_main_names[] = { "bound", "first_touch",
-					       "interleave" };
+					       "interleave", "dynamic" };
 static int repl_main_placement = REPL_MAIN_BOUND;
 static unsigned int repl_free_percent = 10;
 
@@ -470,20 +476,29 @@ static pmd_t *repl_alloc_pgtables(struct mm_struct *mm, pgd_t *pgd,
 	return pmd;
 }
 
-static int repl_main_nid(struct vm_area_struct *vma, unsigned long addr)
+static int repl_interleave_nid(struct vm_area_struct *vma, unsigned long addr)
 {
 	int nid = first_online_node, n;
+
+	for (n = linear_page_index(vma, addr) % num_online_nodes(); n; n--)
+		nid = next_online_node(nid);
+	return nid;
+}
+
+static int repl_main_nid(struct vm_area_struct *vma, unsigned long addr)
+{
+	struct mm_struct *mm = vma->vm_mm;
 
 	switch (READ_ONCE(repl_main_placement)) {
 	case REPL_MAIN_FIRST_TOUCH:
 		return numa_node_id();
 	case REPL_MAIN_INTERLEAVE:
-		for (n = linear_page_index(vma, addr) % num_online_nodes(); n;
-		     n--)
-			nid = next_online_node(nid);
-		return nid;
+		return repl_interleave_nid(vma, addr);
+	case REPL_MAIN_DYNAMIC:
+		if (!repl_has_room(mm, mm->repl->main_nid))
+			return repl_interleave_nid(vma, addr);
 	}
-	return vma->vm_mm->repl->main_nid;
+	return mm->repl->main_nid;
 }
 
 static vm_fault_t repl_install_main(struct vm_area_struct *vma,
@@ -509,8 +524,10 @@ static vm_fault_t repl_install_main(struct vm_area_struct *vma,
 		old = repl_push_alloc_node(nid, mode);
 		ret = do_pte_missing(&vmf);
 		repl_pop_alloc_node(old);
-		trace_repl_main_fill(mm->repl->main_nid, addr,
-				     pte_pfn(repl_pte_read(mm, mm->pgd, addr)));
+		main = repl_pte_read(mm, mm->pgd, addr);
+		if (pte_present(main))
+			trace_repl_main_fill(mm->repl->main_nid, addr,
+					     pte_pfn(main));
 		return ret;
 	}
 	/* swap, migration: do_swap_page expects the pte mapped */
@@ -521,8 +538,9 @@ static vm_fault_t repl_install_main(struct vm_area_struct *vma,
 	old = repl_push_alloc_node(nid, mode);
 	ret = do_swap_page(&vmf);
 	repl_pop_alloc_node(old);
-	trace_repl_main_swapin(mm->repl->main_nid, addr,
-			       pte_pfn(repl_pte_read(mm, mm->pgd, addr)));
+	main = repl_pte_read(mm, mm->pgd, addr);
+	if (pte_present(main))
+		trace_repl_main_swapin(mm->repl->main_nid, addr, pte_pfn(main));
 	return ret;
 }
 
@@ -539,6 +557,8 @@ static void repl_wrprotect_all(struct vm_area_struct *vma, unsigned long addr)
 		if (!ptep)
 			continue;
 		if (pte_write(ptep_get(ptep))) {
+			trace_repl_wrprotect(nid, addr,
+					     pte_pfn(ptep_get(ptep)));
 			ptep_set_wrprotect(mm, addr, ptep);
 			flush = true;
 		}
@@ -654,8 +674,8 @@ static bool repl_refresh_page(struct vm_area_struct *vma, pgd_t *pgd,
 	return true;
 }
 
-static struct folio *repl_release_copy(struct vm_area_struct *vma, int nid,
-				       unsigned long addr, struct page *page)
+static struct folio *repl_release_replica(struct vm_area_struct *vma, int nid,
+					  unsigned long addr, struct page *page)
 {
 	struct folio *folio = page_folio(page);
 
@@ -677,7 +697,7 @@ static void repl_handle_rdprotect(struct vm_area_struct *vma, pgd_t *pgd,
 	trace_repl_refresh(numa_node_id(), addr, pte_pfn(pte));
 }
 
-/* copies of another page than @pfn go stale; ptes sharing it stay valid */
+/* replicas of another page than @pfn go stale; ptes sharing it stay valid */
 static void repl_invalidate(struct vm_area_struct *vma, pgd_t *pgd,
 			    unsigned long addr, unsigned long pfn)
 {
@@ -707,6 +727,19 @@ static void repl_invalidate(struct vm_area_struct *vma, pgd_t *pgd,
 		flush_tlb_page(vma, addr);
 }
 
+/* main takes the last write from an up-to-date replica */
+static void repl_sync_main(struct vm_area_struct *vma, unsigned long addr,
+			   pte_t *mainp)
+{
+	pte_t main = ptep_get(mainp);
+
+	if (!repl_pte_rdprotected(main))
+		return;
+	trace_repl_sync(vma->vm_mm->repl->main_nid, addr, pte_pfn(main));
+	repl_handle_rdprotect(vma, vma->vm_mm->pgd, addr, mainp);
+	folio_mark_dirty(page_folio(vm_normal_page(vma, addr, main)));
+}
+
 static void repl_handle_write(struct vm_area_struct *vma, pgd_t *pgd,
 			      unsigned long addr, pte_t *ptep)
 {
@@ -729,17 +762,27 @@ bool repl_zap_replicas(struct mmu_gather *tlb, struct vm_area_struct *vma,
 		       unsigned long addr, pte_t *mainp)
 {
 	struct mm_struct *mm = vma->vm_mm;
-	pte_t main = ptep_get(mainp), *ptep, pte;
+	pte_t main, *ptep, pte;
 	struct folio *folio;
 	bool full = false;
 	struct page *page;
 	pgd_t *repl_pgd;
+	unsigned long long main_pfn;
 	int nid;
 
-	trace_repl_main_zap(tlb->mm->repl->main_nid, addr, pte_pfn(main));
-
-	if ((vma->vm_flags & VM_SHARED) && repl_pte_rdprotected(main))
-		WARN_ON_ONCE(!repl_refresh_page(vma, mm->pgd, addr, main));
+	main = ptep_get(mainp);
+	main = ptep_get(mainp);
+	if (!pte_present(main)) {
+		if (!softleaf_is_migration(softleaf_from_pte(main)))
+			return false; /* swapped out: replicas went first */
+		/* a migration entry still names main's page */
+		main_pfn = softleaf_to_pfn(softleaf_from_pte(main));
+	} else {
+		main_pfn = pte_pfn(main);
+	}
+	trace_repl_main_zap(tlb->mm->repl->main_nid, addr, main_pfn);
+	if (vma->vm_flags & VM_SHARED && pte_present(main))
+		repl_sync_main(vma, addr, mainp);
 
 	for_each_repl_pgd(mm, nid, repl_pgd) {
 		if (repl_pgd == mm->pgd)
@@ -754,10 +797,10 @@ bool repl_zap_replicas(struct mmu_gather *tlb, struct vm_area_struct *vma,
 		pte_unmap(ptep);
 
 		page = pte_present(pte) ? vm_normal_page(vma, addr, pte) : NULL;
-		if (!page || pte_pfn(pte) == pte_pfn(main))
+		if (!page || pte_pfn(pte) == main_pfn)
 			continue; /* none, or main's page: main's zap frees it */
 
-		folio = repl_release_copy(vma, nid, addr, page);
+		folio = repl_release_replica(vma, nid, addr, page);
 		if (!full) {
 			full = __tlb_remove_folio_pages(tlb, page, 1, false);
 			continue;
@@ -771,7 +814,7 @@ bool repl_zap_replicas(struct mmu_gather *tlb, struct vm_area_struct *vma,
 }
 
 static void repl_drop(struct vm_area_struct *vma, int nid, unsigned long addr,
-		      unsigned long main_pfn, bool shared_only)
+		      unsigned long main_pfn)
 {
 	struct mm_struct *mm = vma->vm_mm;
 	struct page *page;
@@ -782,51 +825,56 @@ static void repl_drop(struct vm_area_struct *vma, int nid, unsigned long addr,
 		return;
 
 	pte = ptep_get(ptep);
-	if (pte_present(pte) && (!shared_only || pte_pfn(pte) == main_pfn)) {
+	if (pte_present(pte)) {
 		ptep_clear_flush(vma, addr, ptep);
 		page = vm_normal_page(vma, addr, pte);
 		if (pte_pfn(pte) == main_pfn)
 			trace_repl_unshare(nid, addr, main_pfn);
 		else if (page)
-			folio_put(repl_release_copy(vma, nid, addr, page));
+			folio_put(repl_release_replica(vma, nid, addr, page));
 	}
 
 	pte_unmap(ptep);
 }
 
-void repl_unmap_main(struct vm_area_struct *vma, unsigned long addr,
-		     pte_t *mainp, bool shared_only)
+void repl_migrate_start(struct vm_area_struct *vma, unsigned long addr,
+			pte_t *mainp)
 {
-	struct mm_struct *mm = vma->vm_mm;
-	pte_t main = ptep_get(mainp);
-	pgd_t *repl_pgd;
-	int nid;
-
-	if (shared_only)
-		trace_repl_unmap_shared(mm->repl->main_nid, addr,
-					pte_pfn(main));
-	else
-		trace_repl_unmap(mm->repl->main_nid, addr, pte_pfn(main));
-
-	if (repl_pte_rdprotected(main) &&
-	    repl_refresh_page(vma, mm->pgd, addr, main))
-		folio_mark_dirty(page_folio(vm_normal_page(vma, addr, main)));
-
-	for_each_repl_pgd(mm, nid, repl_pgd)
-		if (repl_pgd != mm->pgd)
-			repl_drop(vma, nid, addr, pte_pfn(main), shared_only);
+	trace_repl_migrate_start(vma->vm_mm->repl->main_nid, addr,
+				 pte_pfn(ptep_get(mainp)));
+	repl_sync_main(vma, addr, mainp);
+	repl_wrprotect_all(vma, addr);
 }
 
-/* main now lives on its new node: that node's copy is redundant */
+/* main lives on its new page: its sharers follow it, the replica on its node is redundant */
 pte_t repl_migrate_done(struct vm_area_struct *vma, unsigned long addr,
-			pte_t pte, bool writable)
+			pte_t pte, unsigned long old_pfn, bool writable)
 {
 	struct mm_struct *mm = vma->vm_mm;
-	int nid = pfn_to_nid(pte_pfn(pte));
+	int nid, dst = pfn_to_nid(pte_pfn(pte));
+	pgd_t *repl_pgd;
+	pte_t *ptep;
 
-	trace_repl_migrated(mm->repl->main_nid, addr, pte_pfn(pte));
-	if (mm->repl->pgds[nid] && mm->repl->pgds[nid] != mm->pgd)
-		repl_drop(vma, nid, addr, pte_pfn(pte), false);
+	trace_repl_migrate_done(addr, old_pfn, pte_pfn(pte));
+	for_each_repl_pgd(mm, nid, repl_pgd) {
+		if (repl_pgd == mm->pgd)
+			continue;
+
+		if (nid == dst) {
+			repl_drop(vma, nid, addr, old_pfn);
+			continue;
+		}
+
+		ptep = repl_pte_map(mm, repl_pgd, addr);
+		if (!ptep)
+			continue;
+		if (pte_present(ptep_get(ptep)) &&
+		    pte_pfn(ptep_get(ptep)) == old_pfn) {
+			ptep_clear_flush(vma, addr, ptep);
+			set_pte_at(mm, addr, ptep, pte_wrprotect(pte));
+		}
+		pte_unmap(ptep);
+	}
 	return writable ? pte : pte_wrprotect(pte);
 }
 
@@ -842,9 +890,7 @@ void repl_mkclean_main(struct vm_area_struct *vma, unsigned long addr,
 	main = ptep_get(mainp);
 	trace_repl_mkclean(mm->repl->main_nid, addr, pte_pfn(main));
 
-	if (repl_pte_rdprotected(main))
-		repl_handle_rdprotect(vma, mm->pgd, addr, mainp);
-
+	repl_sync_main(vma, addr, mainp);
 	for_each_repl_pgd(mm, nid, repl_pgd) {
 		if (repl_pgd == mm->pgd)
 			continue;
@@ -861,6 +907,115 @@ void repl_mkclean_main(struct vm_area_struct *vma, unsigned long addr,
 	}
 }
 
+/* aging: main is young if itself or any of its replicas was accessed */
+bool repl_referenced(struct vm_area_struct *vma, unsigned long addr,
+		     pte_t *mainp, unsigned int nr)
+{
+	struct mm_struct *mm = vma->vm_mm;
+	unsigned long start = addr;
+	bool young = false;
+	pgd_t *repl_pgd;
+	unsigned int i;
+	pte_t *ptep;
+	int nid;
+
+	for (i = 0; i < nr; i++, addr += PAGE_SIZE) {
+		for_each_repl_pgd(mm, nid, repl_pgd) {
+			if (repl_pgd == mm->pgd)
+				continue;
+			ptep = repl_pte_map(mm, repl_pgd, addr);
+			if (!ptep)
+				continue;
+			if (pte_present(ptep_get(ptep)))
+				young |= ptep_test_and_clear_young(vma, addr,
+								   ptep);
+			pte_unmap(ptep);
+		}
+	}
+	if (young)
+		trace_repl_referenced(mm->repl->main_nid, start,
+				      pte_pfn(ptep_get(mainp)));
+	return young;
+}
+
+/* the node main should move to under its placement policy, or NUMA_NO_NODE */
+int repl_check_placement(struct vm_area_struct *vma, unsigned long addr,
+			 struct folio *folio)
+{
+	int nid;
+
+	if (READ_ONCE(repl_main_placement) != REPL_MAIN_DYNAMIC)
+		return NUMA_NO_NODE;
+	nid = repl_interleave_nid(vma, addr);
+	return nid == folio_nid(folio) ? NUMA_NO_NODE : nid;
+}
+
+static struct folio *repl_move_alloc(struct folio *src, unsigned long nid)
+{
+	gfp_t gfp = (GFP_HIGHUSER_MOVABLE & ~__GFP_RECLAIM) | __GFP_THISNODE |
+		    __GFP_NOWARN | __GFP_NOMEMALLOC;
+
+	return __folio_alloc_node(gfp, 0, nid);
+}
+
+/* main moves to the node its placement policy picks for it */
+bool repl_migrate_misplaced(struct folio *folio, int nid)
+{
+	LIST_HEAD(list);
+
+	if (folio_test_large(folio))
+		return false;
+	folio_unlock(folio);
+	list_add(&folio->lru, &list);
+	if (!migrate_pages(&list, repl_move_alloc, NULL, nid, MIGRATE_ASYNC,
+			   MR_DEMOTION, NULL))
+		return true;
+	list_del(&folio->lru);
+	folio_lock(folio);
+	return false;
+}
+
+void repl_unmap_main(struct vm_area_struct *vma, unsigned long addr,
+		     pte_t *mainp)
+{
+	struct mm_struct *mm = vma->vm_mm;
+	pte_t main = ptep_get(mainp);
+	pgd_t *repl_pgd;
+	int nid;
+
+	trace_repl_unmap_main(mm->repl->main_nid, addr, pte_pfn(main));
+	repl_sync_main(vma, addr, mainp);
+	for_each_repl_pgd(mm, nid, repl_pgd)
+		if (repl_pgd != mm->pgd)
+			repl_drop(vma, nid, addr, pte_pfn(main));
+}
+
+/* reclaim of a replica: main takes its last write first */
+bool repl_unmap_replica(struct vm_area_struct *vma, unsigned long addr,
+			struct folio *folio)
+{
+	struct mm_struct *mm = vma->vm_mm;
+	spinlock_t *ptl;
+	pte_t *mainp, main;
+	bool replica;
+
+	mainp = repl_pte_map_lock(mm, mm->pgd, addr, &ptl);
+	if (!mainp)
+		return false;
+
+	main = ptep_get(mainp);
+	replica = pte_present(main) && pte_pfn(main) != folio_pfn(folio);
+	if (replica) {
+		trace_repl_unmap_replica(folio_nid(folio), addr,
+					 folio_pfn(folio));
+		repl_sync_main(vma, addr, mainp);
+		repl_drop(vma, folio_nid(folio), addr, pte_pfn(main));
+	}
+
+	pte_unmap_unlock(mainp, ptl);
+	return replica;
+}
+
 static bool repl_vma_skip(struct vm_area_struct *vma, void *arg)
 {
 	return !addr_is_replicated(vma->vm_mm, vma->vm_start);
@@ -871,13 +1026,8 @@ static bool repl_sync_one(struct folio *folio, struct vm_area_struct *vma,
 {
 	DEFINE_FOLIO_VMA_WALK(pvmw, folio, vma, addr, 0);
 
-	while (page_vma_mapped_walk(&pvmw)) {
-		trace_repl_sync(vma->vm_mm->repl->main_nid, pvmw.address,
-				pte_pfn(ptep_get(pvmw.pte)));
-		if (repl_pte_rdprotected(ptep_get(pvmw.pte)))
-			repl_handle_rdprotect(vma, vma->vm_mm->pgd,
-					      pvmw.address, pvmw.pte);
-	}
+	while (page_vma_mapped_walk(&pvmw))
+		repl_sync_main(vma, pvmw.address, pvmw.pte);
 	return true;
 }
 
@@ -914,7 +1064,7 @@ void repl_sync_folio(struct folio *folio)
 	repl_walk_folio(folio, repl_sync_one);
 }
 
-/* write() changed main's folio: its copies go stale */
+/* write() changed main's folio: its replicas go stale */
 void repl_invalidate_folio(struct folio *folio)
 {
 	repl_walk_folio(folio, repl_invalidate_one);
@@ -997,6 +1147,7 @@ vm_fault_t repl_handle_mm_fault(struct vm_area_struct *vma, unsigned long addr,
 	if (!main_pmd)
 		return VM_FAULT_OOM;
 	main = repl_pte_read(mm, mm->pgd, addr);
+
 	if (!pte_present(main)) {
 		ret = repl_install_main(vma, addr, flags, main_pmd, main);
 		if (ret &
@@ -1052,6 +1203,7 @@ static void repl_stat_range(struct mm_struct *mm, unsigned long addr,
 				s = &st->node[nid];
 				s->local += pfn_to_nid(pte_pfn(pte)) == nid;
 				s->dirty += pte_dirty(pte);
+				s->young += !!pte_young(pte);
 				if (repl_pte_rdprotected(pte))
 					s->s++;
 				else if (pte_write(pte))
@@ -1099,18 +1251,18 @@ static void repl_stat_print(struct seq_file *m, struct mm_struct *mm,
 		any = true;
 	}
 	seq_puts(m, any ? "\n" : " none\n");
-	seq_printf(m, "%-9s %7s %7s %7s %7s %7s %7s %7s | %7s %7s\n", "node",
-		   "write", "read", "stale", "dirty", "local", "remote",
-		   "copies", "main", "pages");
+	seq_printf(m, "%-9s %7s %7s %7s %7s %7s %7s %7s %7s | %7s %7s\n",
+		   "node", "write", "read", "stale", "dirty", "young", "local",
+		   "remote", "copies", "main", "pages");
 	for_each_repl_pgd(mm, nid, pgd) {
 		s = &st->node[nid];
 		mapped = s->w + s->r + s->s;
 		snprintf(copies, sizeof(copies), "%lu", mapped - s->shared);
 		seq_printf(
 			m,
-			"n%d%-7s %7lu %7lu %7lu %7lu %7lu %7lu %7s | %7lu %7lu\n",
+			"n%d%-7s %7lu %7lu %7lu %7lu %7lu %7lu %7lu %7s | %7lu %7lu\n",
 			nid, nid == main_nid ? " (main)" : "", s->w, s->r, s->s,
-			s->dirty, s->local, mapped - s->local,
+			s->dirty, s->young, s->local, mapped - s->local,
 			nid == main_nid ? "-" : copies, st->main_on[nid],
 			st->pages[nid]);
 	}
@@ -1165,6 +1317,29 @@ static ssize_t main_placement_store(struct kobject *kobj,
 
 static struct kobj_attribute main_placement_attr = __ATTR_RW(main_placement);
 
+static ssize_t free_percent_show(struct kobject *kobj,
+				 struct kobj_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%u\n", READ_ONCE(repl_free_percent));
+}
+
+static ssize_t free_percent_store(struct kobject *kobj,
+				  struct kobj_attribute *attr, const char *buf,
+				  size_t count)
+{
+	unsigned int v;
+	int ret = kstrtouint(buf, 10, &v);
+
+	if (ret)
+		return ret;
+	if (v > 100)
+		return -EINVAL;
+	WRITE_ONCE(repl_free_percent, v);
+	return count;
+}
+
+static struct kobj_attribute free_percent_attr = __ATTR_RW(free_percent);
+
 static ssize_t files_show(struct kobject *kobj, struct kobj_attribute *attr,
 			  char *buf)
 {
@@ -1206,6 +1381,7 @@ static struct kobj_attribute files_attr = __ATTR_RW(files);
 
 static struct attribute *repl_attrs[] = {
 	&main_placement_attr.attr,
+	&free_percent_attr.attr,
 	&files_attr.attr,
 	NULL,
 };

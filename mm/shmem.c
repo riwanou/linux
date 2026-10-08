@@ -3372,6 +3372,7 @@ static ssize_t shmem_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
 			 * before reading the page on the kernel side.
 			 */
 			if (mapping_writably_mapped(mapping)) {
+				repl_read_folio(folio);
 				if (likely(!fallback_page_copy))
 					flush_dcache_folio(folio);
 				else
@@ -3567,6 +3568,7 @@ static ssize_t shmem_file_splice_read(struct file *in, loff_t *ppos,
 			 * before reading the page on the kernel side.
 			 */
 			if (mapping_writably_mapped(mapping)) {
+				repl_read_folio(folio);
 				if (likely(!fallback_page_splice))
 					flush_dcache_folio(folio);
 				else

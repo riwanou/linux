@@ -75,12 +75,22 @@ static inline bool addr_is_replicated(struct mm_struct *mm, unsigned long addr)
 
 bool repl_zap_replicas(struct mmu_gather *tlb, struct vm_area_struct *vma,
 		       unsigned long addr, pte_t *mainp);
-void repl_unmap_main(struct vm_area_struct *vma, unsigned long addr,
-		     pte_t *mainp, bool shared_only);
+void repl_migrate_start(struct vm_area_struct *vma, unsigned long addr,
+			pte_t *mainp);
 pte_t repl_migrate_done(struct vm_area_struct *vma, unsigned long addr,
-			pte_t pte, bool writable);
+			pte_t pte, unsigned long old_pfn, bool writable);
 void repl_mkclean_main(struct vm_area_struct *vma, unsigned long addr,
 		       pte_t *mainp);
+
+bool repl_referenced(struct vm_area_struct *vma, unsigned long addr,
+		     pte_t *mainp, unsigned int nr);
+int repl_check_placement(struct vm_area_struct *vma, unsigned long addr,
+			 struct folio *folio);
+bool repl_migrate_misplaced(struct folio *folio, int nid);
+void repl_unmap_main(struct vm_area_struct *vma, unsigned long addr,
+		     pte_t *mainp);
+bool repl_unmap_replica(struct vm_area_struct *vma, unsigned long addr,
+			struct folio *folio);
 
 void repl_sync_folio(struct folio *folio);
 void repl_invalidate_folio(struct folio *folio);
@@ -118,12 +128,22 @@ static inline bool addr_is_replicated(struct mm_struct *mm, unsigned long addr) 
 
 static inline bool repl_zap_replicas(struct mmu_gather *tlb, struct vm_area_struct *vma,
 		       unsigned long addr, pte_t *mainp) { return false; }
-static inline void repl_unmap_main(struct vm_area_struct *vma, unsigned long addr,
-		     pte_t *mainp, bool shared_only) {}
+static inline void repl_migrate_start(struct vm_area_struct *vma, unsigned long addr,
+			 pte_t *mainp) {}
 static inline pte_t repl_migrate_done(struct vm_area_struct *vma,
-		unsigned long addr, pte_t pte, bool writable) { return pte; }
+		unsigned long addr, pte_t pte, unsigned long old_pfn, bool writable) { return pte; }
 static inline void repl_mkclean_main(struct vm_area_struct *vma, unsigned long addr,
 		       pte_t *mainp) {}
+
+static inline bool repl_referenced(struct vm_area_struct *vma, unsigned long addr,
+		     pte_t *mainp, unsigned int nr) { return false; }
+static inline int repl_check_placement(struct vm_area_struct *vma, unsigned long addr,
+			 struct folio *folio) { return NUMA_NO_NODE; }
+static inline bool repl_migrate_misplaced(struct folio *folio, int nid) { return false; }
+static inline void repl_unmap_main(struct vm_area_struct *vma, unsigned long addr,
+		     pte_t *mainp) {}
+static inline bool repl_unmap_replica(struct vm_area_struct *vma, unsigned long addr,
+			struct folio *folio) { return false; }
 
 static inline void repl_sync_folio(struct folio *folio) {}
 static inline void repl_invalidate_folio(struct folio *folio) {}

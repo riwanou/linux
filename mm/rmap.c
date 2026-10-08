@@ -915,6 +915,7 @@ struct folio_referenced_arg {
 	int referenced;
 	vma_flags_t vma_flags;
 	struct mem_cgroup *memcg;
+	int repl_migrate_nid;
 };
 
 /*
@@ -999,6 +1000,13 @@ static bool folio_referenced_one(struct folio *folio,
 			WARN_ON_ONCE(1);
 		}
 
+		if (pvmw.pte && addr_is_replicated(vma->vm_mm, address)) {
+			if (repl_referenced(vma, address, pvmw.pte, nr))
+				referenced++;
+			pra->repl_migrate_nid =
+				repl_check_placement(vma, address, folio);
+		}
+
 		ptes += nr;
 		pra->mapcount -= nr;
 		/*
@@ -1064,6 +1072,8 @@ static bool invalid_folio_referenced_vma(struct vm_area_struct *vma, void *arg)
  * @is_locked: Caller holds lock on the folio.
  * @memcg: target memory cgroup
  * @vma_flags: A combination of all the vma->flags which referenced the folio.
+ * @repl_migrate_nid: Set to the node a replicated main should move to, or
+ *                    NUMA_NO_NODE. May be NULL.
  *
  * Quick test_and_clear_referenced for all mappings of a folio,
  *
@@ -1071,12 +1081,14 @@ static bool invalid_folio_referenced_vma(struct vm_area_struct *vma, void *arg)
  * the function bailed out due to rmap lock contention.
  */
 int folio_referenced(struct folio *folio, int is_locked,
-		struct mem_cgroup *memcg, vma_flags_t *vma_flags)
+		     struct mem_cgroup *memcg, vma_flags_t *vma_flags,
+		     int *repl_migrate_nid)
 {
 	bool we_locked = false;
 	struct folio_referenced_arg pra = {
 		.mapcount = folio_mapcount(folio),
 		.memcg = memcg,
+		.repl_migrate_nid = NUMA_NO_NODE,
 	};
 	struct rmap_walk_control rwc = {
 		.rmap_one = folio_referenced_one,
@@ -1102,6 +1114,8 @@ int folio_referenced(struct folio *folio, int is_locked,
 
 	rmap_walk(folio, &rwc);
 	vma_flags_set_mask(vma_flags, pra.vma_flags);
+	if (repl_migrate_nid)
+		*repl_migrate_nid = pra.repl_migrate_nid;
 
 	if (we_locked)
 		folio_unlock(folio);
@@ -2233,6 +2247,10 @@ static bool try_to_unmap_one(struct folio *folio, struct vm_area_struct *vma,
 	if (flags & TTU_SYNC)
 		pvmw.flags = PVMW_SYNC;
 
+	if (addr_is_replicated(mm, address) &&
+	    repl_unmap_replica(vma, address, folio))
+		return true;
+
 	/*
 	 * For THP, we have to assume the worse case ie pmd for invalidation.
 	 *
@@ -2330,7 +2348,7 @@ static bool try_to_unmap_one(struct folio *folio, struct vm_area_struct *vma,
 
 		page = folio_page(folio, pfn - folio_pfn(folio));
 		if (addr_is_replicated(mm, address))
-			repl_unmap_main(vma, address, pvmw.pte, false);
+			repl_unmap_main(vma, address, pvmw.pte);
 
 		if (likely(pte_present(pteval))) {
 			nr_pages = folio_unmap_pte_batch(folio, &pvmw, flags, pteval);
@@ -2585,7 +2603,7 @@ static bool try_to_migrate_one(struct folio *folio, struct vm_area_struct *vma,
 
 		subpage = folio_page(folio, pfn - folio_pfn(folio));
 		if (addr_is_replicated(mm, address))
-			repl_unmap_main(vma, address, pvmw.pte, true);
+			repl_migrate_start(vma, address, pvmw.pte);
 		anon_exclusive = folio_test_anon(folio) &&
 				 PageAnonExclusive(subpage);
 

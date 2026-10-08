@@ -1835,11 +1835,6 @@ static inline int zap_present_ptes(struct mmu_gather *tlb,
 	struct page *page;
 	int nr;
 
-	if (addr_is_replicated(mm, addr)) {
-		max_nr = 1;	/* replicas are zapped one address at a time */
-		if (repl_zap_replicas(tlb, vma, addr, pte))
-			*force_flush = *force_break = true;
-	}
 	page = vm_normal_page(vma, addr, ptent);
 	if (!page) {
 		/* We don't need up-to-date accessed/dirty bits. */
@@ -1969,6 +1964,12 @@ static inline int do_zap_pte_range(struct mmu_gather *tlb,
 			return nr;
 		pte += nr;
 		addr += nr * PAGE_SIZE;
+	}
+
+	if (addr_is_replicated(tlb->mm, addr)) {
+		max_nr = 1;	/* replicas are zapped one address at a time */
+		if (repl_zap_replicas(tlb, vma, addr, pte))
+			*force_flush = *force_break = true;
 	}
 
 	if (pte_present(ptent))
