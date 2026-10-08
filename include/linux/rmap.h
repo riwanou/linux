@@ -842,8 +842,9 @@ static inline int folio_try_share_anon_rmap_pmd(struct folio *folio,
 /*
  * Called from mm/vmscan.c to handle paging out
  */
-int folio_referenced(struct folio *, int is_locked,
-		struct mem_cgroup *memcg, vma_flags_t *vma_flags);
+int folio_referenced(struct folio *folio, int is_locked,
+		     struct mem_cgroup *memcg, vma_flags_t *vma_flags,
+		     int *repl_migrate_nid);
 
 void try_to_migrate(struct folio *folio, enum ttu_flags flags);
 void try_to_unmap(struct folio *, enum ttu_flags flags);
@@ -977,7 +978,9 @@ struct anon_vma *folio_lock_anon_vma_read(const struct folio *folio,
 #define anon_vma_prepare(vma)	(0)
 
 static inline int folio_referenced(struct folio *folio, int is_locked,
-		struct mem_cgroup *memcg, vma_flags_t *vma_flags)
+				   struct mem_cgroup *memcg,
+				   vma_flags_t *vma_flags,
+				   int *repl_migrate_nid)
 {
 	vma_flags_clear_all(vma_flags);
 	return 0;

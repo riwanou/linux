@@ -866,13 +866,14 @@ static bool lru_gen_set_refs(struct folio *folio, const vma_flags_t *vma_flags)
 #endif /* CONFIG_LRU_GEN */
 
 static enum folio_references folio_check_references(struct folio *folio,
-						  struct scan_control *sc)
+						    struct scan_control *sc,
+						    int *repl_migrate_nid)
 {
 	int referenced_ptes, referenced_folio;
 	vma_flags_t vma_flags;
 
 	referenced_ptes = folio_referenced(folio, 1, sc->target_mem_cgroup,
-					   &vma_flags);
+					   &vma_flags, repl_migrate_nid);
 
 	/*
 	 * The supposedly reclaimable folio was found to be in a VM_LOCKED vma.
@@ -1078,6 +1079,7 @@ retry:
 		struct address_space *mapping;
 		struct folio *folio;
 		enum folio_references references = FOLIOREF_RECLAIM;
+		int repl_migrate_nid = NUMA_NO_NODE;
 		bool dirty, writeback;
 		unsigned int nr_pages;
 
@@ -1229,7 +1231,14 @@ retry:
 		}
 
 		if (!ignore_references)
-			references = folio_check_references(folio, sc);
+			references = folio_check_references(folio, sc, &repl_migrate_nid);
+
+		if (references != FOLIOREF_RECLAIM &&
+		    repl_migrate_nid != NUMA_NO_NODE &&
+		    repl_migrate_misplaced(folio, repl_migrate_nid)) {
+			nr_reclaimed += nr_pages;
+			continue;
+		}
 
 		switch (references) {
 		case FOLIOREF_ACTIVATE:
@@ -2113,7 +2122,7 @@ static void shrink_active_list(unsigned long nr_to_scan,
 
 		/* Referenced or rmap lock contention: rotate */
 		if (folio_referenced(folio, 0, sc->target_mem_cgroup,
-				     &vma_flags) != 0) {
+				     &vma_flags, NULL) != 0) {
 			/*
 			 * Identify referenced, file-backed active folios and
 			 * give them one more trip around the active list. So
