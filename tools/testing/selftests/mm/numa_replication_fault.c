@@ -11,13 +11,13 @@
 
 #define PER_NODE 2
 #define MAX_THREADS (MAX_NODES * PER_NODE)
-#define STRESS_PAGES 16
 #define STRESS_ITERS 20000
 
 static pthread_barrier_t start;
 static char *shared;
 static int threads, stop;
-static int final[MAX_THREADS][STRESS_PAGES];
+static int stress_pages, *final; /* final[t * stress_pages + page] */
+static int threads, stop;
 
 /*
  * Steps: "w1" node 1 writes, "rL" the last node reads, "r*" every node reads.
@@ -35,11 +35,16 @@ static int final[MAX_THREADS][STRESS_PAGES];
  *                       lives only in node 1's copy until munmap syncs it
  *
  * "m1" moves main's pages to node 1, its tree stays on node 0:
- * r0 mL wL m0 r* w1 r*  main moves alone, L shares it and writes through
- *                       it, main moves off: the sharer goes
+ * r0 mL wL m0 r* wL r*  L writes main's page through its sharer pte,
+ *                       keeps it through the move and writes again
  * r* w0 m1 w0 r* w1 r*  writable main lands on node 1's stale copy, which
  *                       goes; node 1 then shares main and writes through it
  * w0 r* wL m1 r* w0 r*  stale main refreshed from L, lands on node 1
+ *
+ * "x1" reclaims node 1:
+ * w0 r* x1 r*           node 1's replica is dropped, node 1 refaults it
+ * w0 r* w1 x1 r*        node 1's replica holds the last write: main takes
+ *                       it before the replica goes
  */
 static const char *const protocols[] = {
 	"w0 r*",
@@ -50,6 +55,9 @@ static const char *const protocols[] = {
 	"r0 mL wL m0 r* w1 r*",
 	"r* w0 m1 w0 r* w1 r*",
 	"w0 r* wL m1 r* w0 r*",
+	/* with reclaim */
+	"w0 r* x1 r*",
+	"w0 r* w1 x1 r*",
 };
 
 static int file_holds(int fd, char want)
@@ -110,38 +118,43 @@ static int alloc_check(void)
 	return ok;
 }
 
+/* threads read, write and allocate; final[]/last[] are [page * threads + t] */
 static void *stresser(void *arg)
 {
-	int t = (long)arg, last[STRESS_PAGES][MAX_THREADS] = { 0 };
+	int t = (long)arg, it, page, s, v;
+	int *last = calloc(stress_pages * threads, sizeof(*last));
 	unsigned int seed = t;
-	int it, page, s, v;
+	void *ret = (void *)1;
 
 	run_on_node(t % nodes);
 	pthread_barrier_wait(&start);
-	for (it = 0; it < STRESS_ITERS; it++) {
+	for (it = 0; it < STRESS_ITERS && ret; it++) {
 		if (!(it % 256) && !alloc_check()) {
 			ksft_print_msg("thread %d: fresh region broken\n", t);
-			return NULL;
+			ret = NULL;
+			break;
 		}
-		page = rand_r(&seed) % STRESS_PAGES;
+		page = rand_r(&seed) % stress_pages;
 		if (!(rand_r(&seed) % 4)) {
-			slot_set(page, t, ++final[t][page]);
+			slot_set(page, t, ++final[page * threads + t]);
 			continue;
 		}
 		/* one writer per slot: a value going back is a stale copy */
 		for (s = 0; s < threads; s++) {
 			v = slot_get(page, s);
-			if (v >= last[page][s]) {
-				last[page][s] = v;
+			if (v >= last[page * threads + s]) {
+				last[page * threads + s] = v;
 				continue;
 			}
 			ksft_print_msg(
 				"thread %d page %d slot %d: %d after %d\n", t,
-				page, s, v, last[page][s]);
-			return NULL;
+				page, s, v, last[page * threads + s]);
+			ret = NULL;
+			break;
 		}
 	}
-	return (void *)1;
+	free(last);
+	return ret;
 }
 
 /* main's pages tour the nodes while the stressers fault on them */
@@ -150,64 +163,124 @@ static void *migrator(void *arg)
 	unsigned long n, moved = 0;
 
 	for (n = 0; !__atomic_load_n(&stop, __ATOMIC_RELAXED); n++)
-		moved += migrate_main(shared, STRESS_PAGES * PAGE, n % nodes);
+		moved += migrate_main(shared, stress_pages * PAGE, n % nodes);
 	ksft_print_msg("%lu pages migrated\n", moved);
 	return (void *)moved;
 }
 
-static int stress(const struct backing *b, bool migrate)
+/* reclaim nodes @first.. in turn until stopped, and report what it unmapped */
+static void reclaim_nodes(int first, const char *what)
 {
-	pthread_t th[MAX_THREADS], mig;
+	int unmap_main = event_open("repl_unmap_main");
+	int unmap_replica = event_open("repl_unmap_replica");
+	unsigned long n;
+
+	for (n = 0; !__atomic_load_n(&stop, __ATOMIC_RELAXED); n++)
+		reclaim_node(first + n % (nodes - first), what);
+	ksft_print_msg("%ld main and %ld replica pages unmapped\n",
+		       event_count(unmap_main), event_count(unmap_replica));
+}
+
+/* every node in turn: replicas and mains alike */
+static void *reclaim_all(void *arg)
+{
+	reclaim_nodes(0, "64M");
+	return (void *)1;
+}
+
+/* replica nodes only, file LRU only: that is where replicas are */
+static void *reclaim_replicas(void *arg)
+{
+	reclaim_nodes(1, "1G swappiness=0");
+	return (void *)1;
+}
+
+static int stress(const struct backing *b, void *(*background)(void *))
+{
+	pthread_t th[MAX_THREADS], bg;
 	int t, n, page, fd, ok = 1;
 	void *ret;
 
 	threads = nodes * PER_NODE;
-	memset(final, 0, sizeof(final));
-	shared = map(b, STRESS_PAGES * PAGE, &fd);
+	stress_pages = getenv("REPL_SZ") ? sz / PAGE : 16;
+	sync();
+	write_file("/proc/sys/vm/drop_caches", "1");
+	final = calloc(stress_pages * threads, sizeof(*final));
+	shared = map(b, stress_pages * PAGE, &fd);
 	stop = 0;
 	pthread_barrier_init(&start, NULL, threads);
+
+	run_on_node(0);
+	for (page = 0; page < stress_pages; page++)
+		(void)slot_get(page, 0);
+
 	for (t = 0; t < threads; t++)
 		pthread_create(&th[t], NULL, stresser, (void *)(long)t);
-	if (migrate)
-		pthread_create(&mig, NULL, migrator, NULL);
+	if (background)
+		pthread_create(&bg, NULL, background, NULL);
 	for (t = 0; t < threads; t++) {
 		pthread_join(th[t], &ret);
 		ok &= ret != NULL;
 	}
-	if (migrate) {
+	if (background) {
 		__atomic_store_n(&stop, 1, __ATOMIC_RELAXED);
-		pthread_join(mig, &ret);
+		pthread_join(bg, &ret);
 		ok &= ret != NULL;
 	}
 	pthread_barrier_destroy(&start);
+	print_stat("stress");
 
+	/* every node must read each thread's last write */
 	for (n = 0; ok && n < nodes; n++) {
 		run_on_node(n);
-		for (page = 0; page < STRESS_PAGES; page++)
+		for (page = 0; page < stress_pages; page++)
 			for (t = 0; t < threads; t++) {
-				if (slot_get(page, t) == final[t][page])
+				if (slot_get(page, t) ==
+				    final[page * threads + t])
 					continue;
 				ksft_print_msg(
 					"node %d page %d slot %d: %d, want %d\n",
 					n, page, t, slot_get(page, t),
-					final[t][page]);
+					final[page * threads + t]);
 				ok = 0;
 				goto out;
 			}
 	}
 out:
-	unmap(shared, STRESS_PAGES * PAGE, fd);
+	unmap(shared, stress_pages * PAGE, fd);
+	free(final);
 	return ok;
 }
 
 static int test_stress(const struct backing *b, const char *name)
 {
-	return stress(b, false);
+	return stress(b, NULL);
 }
 
 static int test_stress_migrate(const struct backing *b, const char *name)
 {
-	return stress(b, true);
+	return stress(b, migrator);
+}
+
+static int test_stress_reclaim(const struct backing *b, const char *name)
+{
+	return stress(b, reclaim_all);
+}
+
+static int test_stress_reclaim_replicas(const struct backing *b,
+					const char *name)
+{
+	return stress(b, reclaim_replicas);
+}
+
+static int test_stress_dynamic(const struct backing *b, const char *name)
+{
+	int ok;
+
+	set_placement("dynamic");
+	ok = stress(b, reclaim_all);
+	set_placement("bound");
+	return ok;
 }
 
 /* node 0 holds main, node L touches first */
@@ -231,8 +304,8 @@ static int test_main_placement(const struct backing *b, const char *mode)
 
 	set_placement(mode);
 	p = map(b, sz, &fd);
-	madvise(p, sz,
-		MADV_RANDOM); /* readahead would place neighbours together */
+	/* readahead would place neighbours together */
+	madvise(p, sz, MADV_RANDOM);
 	ok = run_steps(p, "wL r*", &val);
 	for (i = 0; i < n; i++)
 		pages[i] = p + i * PAGE;
@@ -252,19 +325,34 @@ static int test_main_placement(const struct backing *b, const char *mode)
 	return ok;
 }
 
+/* dynamic with no room anywhere: new mains go to their interleave home */
+static int test_dynamic_full(const struct backing *b, const char *name)
+{
+	const char *knob = "/sys/kernel/mm/numa_replication/free_percent";
+	int ok;
+
+	write_file(knob, "100");
+	ok = test_main_placement(b, "dynamic");
+	write_file(knob, "10");
+	return ok;
+}
+
 int main(int argc, char **argv)
 {
 	unsigned int b, i;
 
 	repl_test_init(argc, argv);
-	ksft_set_plan(ARRAY_SIZE(backings) * (5 + ARRAY_SIZE(protocols)));
+	ksft_set_plan(ARRAY_SIZE(backings) * (9 + ARRAY_SIZE(protocols)));
 	for (b = 0; b < ARRAY_SIZE(backings); b++) {
 		for (i = 0; i < ARRAY_SIZE(protocols); i++)
 			run(test_protocol, &backings[b], protocols[i]);
-		run(test_stress, &backings[b],
-		    "threads read, write and allocate");
-		run(test_stress_migrate, &backings[b],
-		    "threads read, write and allocate while main migrates");
+		run(test_stress, &backings[b], "stress");
+		run(test_stress_migrate, &backings[b], "stress: migrate");
+		run(test_stress_reclaim, &backings[b], "stress: reclaim");
+		run(test_stress_reclaim_replicas, &backings[b],
+		    "stress: reclaim replicas");
+		run(test_stress_dynamic, &backings[b], "stress: dynamic");
+		run(test_dynamic_full, &backings[b], "dynamic: no room");
 		run(test_main_placement, &backings[b], "bound");
 		run(test_main_placement, &backings[b], "first_touch");
 		run(test_main_placement, &backings[b], "interleave");

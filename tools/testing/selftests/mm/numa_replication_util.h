@@ -12,6 +12,8 @@
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
+#include <sys/stat.h>
+#include <linux/perf_event.h>
 
 #include "kselftest.h"
 
@@ -38,6 +40,7 @@ struct backing {
 static const struct backing backings[] = {
 	{ "anon", 0 },
 	{ "file", 1 },
+	{ "shm", 2 },
 };
 
 static inline int repl_write(const char *v)
@@ -135,6 +138,33 @@ static inline long read_long(const char *path)
 	return v;
 }
 
+/* count a numa_replication event in this process and its future threads */
+static inline int event_open(const char *name)
+{
+	struct perf_event_attr attr = {
+		.type = PERF_TYPE_TRACEPOINT,
+		.size = sizeof(attr),
+		.inherit = 1,
+	};
+	char path[128];
+
+	snprintf(path, sizeof(path),
+		 "/sys/kernel/tracing/events/numa_replication/%s/id", name);
+	attr.config = read_long(path);
+	return syscall(SYS_perf_event_open, &attr, 0, -1, -1, 0);
+}
+
+static inline long event_count(int fd)
+{
+	long long v = -1;
+
+	if (fd >= 0 && read(fd, &v, sizeof(v)) != sizeof(v))
+		v = -1;
+	if (fd >= 0)
+		close(fd);
+	return v;
+}
+
 static inline void set_placement(const char *mode)
 {
 	write_file("/sys/kernel/mm/numa_replication/main_placement", mode);
@@ -145,7 +175,11 @@ static inline char *map(const struct backing *b, unsigned long len, int *fd)
 	int flags = b->file ? MAP_SHARED : MAP_PRIVATE | MAP_ANONYMOUS;
 	char *p;
 
-	*fd = b->file ? test_file(len) : -1;
+	*fd = b->file == 2 ? memfd_create("repl", 0) :
+	      b->file	   ? test_file(len) :
+			     -1;
+	if (b->file == 2 && ftruncate(*fd, len))
+		ksft_exit_fail_msg("memfd: %s\n", strerror(errno));
 	p = mmap(NULL, len, PROT_READ | PROT_WRITE, flags | MAP_REPL, *fd, 0);
 	if (p == MAP_FAILED)
 		ksft_exit_fail_msg("mmap %s: %s\n", b->name, strerror(errno));
@@ -224,9 +258,52 @@ static inline unsigned long migrate_main(char *p, unsigned long len, int node)
 	return moved;
 }
 
+/* proactive reclaim through @path: @what is "<size> [swappiness=<n>]" */
+static inline void reclaim(const char *path, const char *what)
+{
+	int fd;
+
+	/* node reclaim skips nodes with little page cache unless told not to */
+	write_file("/proc/sys/vm/min_unmapped_ratio", "0");
+	write_file("/proc/sys/vm/min_slab_ratio", "0");
+	fd = open(path, O_WRONLY);
+	if (fd < 0)
+		return;
+	if (write(fd, what, strlen(what)) < 0 && errno != EAGAIN)
+		ksft_print_msg("%s: %s\n", path, strerror(errno));
+	close(fd);
+}
+
+static inline void reclaim_node(int node, const char *what)
+{
+	char path[64];
+
+	snprintf(path, sizeof(path), "/sys/devices/system/node/node%d/reclaim",
+		 node);
+	reclaim(path, what);
+}
+
+/* move the whole process into cgroup @name, or back to the root if NULL */
+static inline int join_cgroup(const char *name)
+{
+	char path[128], pid[16];
+
+	if (name) {
+		write_file("/sys/fs/cgroup/cgroup.subtree_control", "+memory");
+		snprintf(path, sizeof(path), "/sys/fs/cgroup/%s", name);
+		mkdir(path, 0755);
+	} else {
+		snprintf(path, sizeof(path), "/sys/fs/cgroup");
+	}
+	strcat(path, "/cgroup.procs");
+	snprintf(pid, sizeof(pid), "%d", getpid());
+	return access(path, W_OK) == 0 && (write_file(path, pid), 1);
+}
+
 /*
  * "w1": node 1 writes, "rL": the last node reads, "r*": every node reads,
  * "m1": main's pages move to node 1
+ * "x1": node 1's memory is reclaimed
  */
 static inline int run_steps(char *p, const char *steps, char *val)
 {
@@ -249,7 +326,8 @@ static inline int run_steps(char *p, const char *steps, char *val)
 				ksft_print_msg("main did not move to node %d\n",
 					       n);
 				return 0;
-			}
+			} else if (tok[0] == 'x')
+				reclaim_node(n, "1G");
 		}
 		print_stat(tok);
 	}
