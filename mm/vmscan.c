@@ -1231,12 +1231,15 @@ retry:
 		}
 
 		if (!ignore_references)
-			references = folio_check_references(folio, sc, &repl_migrate_nid);
+			references = folio_check_references(folio, sc,
+							    &repl_migrate_nid);
 
 		if (references != FOLIOREF_RECLAIM &&
 		    repl_migrate_nid != NUMA_NO_NODE &&
 		    repl_migrate_misplaced(folio, repl_migrate_nid)) {
-			nr_reclaimed += nr_pages;
+			/* moving main frees its node, not its cgroup's total */
+			if (!cgroup_reclaim(sc))
+				nr_reclaimed += nr_pages;
 			continue;
 		}
 
