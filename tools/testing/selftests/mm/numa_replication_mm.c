@@ -32,6 +32,17 @@ static const char *const pwrites[] = {
 	"pwrite: r* mL rL w1",
 };
 
+/*
+ * main clean in the swap cache, written through a sharer: only the sharer's
+ * pte is dirty, and main must still reach swap at the next pageout
+ * r1 w1     the sharer goes at the pageout
+ * r1 w1 m0  the migration re-points the sharer first
+ */
+static const char *const sharer_writes[] = {
+	"sharer write: r1 w1",
+	"sharer write: r1 w1 m0",
+};
+
 /* pagemap bit 63: main's pte maps a page in memory */
 static int main_resident(char *p)
 {
@@ -80,6 +91,54 @@ static int page_cache_filler(unsigned long mb)
 			break;
 	fsync(fd);
 	return fd;
+}
+
+static long read_vmstat(const char *name)
+{
+	FILE *f = fopen("/proc/vmstat", "r");
+	char key[64];
+	long v = -1;
+
+	while (f && fscanf(f, "%63s %ld", key, &v) == 2 && strcmp(key, name))
+		v = -1;
+	if (f)
+		fclose(f);
+	return v;
+}
+
+/* every page isolated to move went back or moved: nr_isolated_* never < 0, back to 0 */
+static int isolated_balanced(int kmsg)
+{
+	long anon, file;
+	char rec[1024];
+	ssize_t len;
+	int ok = 1;
+
+	write_file("/proc/sys/vm/stat_refresh", "1");
+	while ((len = read(kmsg, rec, sizeof(rec) - 1)) > 0) {
+		rec[len] = 0;
+		if (!strstr(rec, "vmstat_refresh: nr_isolated"))
+			continue;
+		ksft_print_msg("%s", strchr(rec, ';') + 1);
+		ok = 0;
+	}
+	anon = read_vmstat("nr_isolated_anon");
+	file = read_vmstat("nr_isolated_file");
+	ksft_print_msg("nr_isolated anon %ld file %ld\n", anon, file);
+	return ok && !anon && !file;
+}
+
+/* every write to storage done: a swap slot holds what was paged out */
+static void wait_writeback(void)
+{
+	int i;
+
+	for (i = 0; i < 1000; i++) {
+		write_file("/proc/sys/vm/stat_refresh", "1");
+		if (!read_vmstat("nr_writeback"))
+			return;
+		usleep(1000);
+	}
 }
 
 static int test_writeback(const struct backing *b, const char *name)
@@ -184,6 +243,31 @@ static int test_pageout(const struct backing *b, const char *name)
 	return ok;
 }
 
+static int test_sharer_write(const struct backing *b, const char *name)
+{
+	char val = 0, *p;
+	int fd, ok;
+
+	if (b->file)
+		return -1; /* a file or shm main is dirtied on every write */
+	set_placement("first_touch");
+	p = map(b, sz, &fd);
+	ok = run_steps(p, "w1", &val);
+	madvise(p, sz, MADV_PAGEOUT);
+	if (main_resident(p)) {
+		unmap(p, sz, fd);
+		set_placement("bound");
+		return -1; /* nothing paged out: anon needs swap */
+	}
+	wait_writeback();
+	ok = ok && run_steps(p, strchr(name, ':') + 1, &val);
+	madvise(p, sz, MADV_PAGEOUT);
+	ok = ok && run_steps(p, "r*", &val);
+	unmap(p, sz, fd);
+	set_placement("bound");
+	return ok;
+}
+
 /* truncation zaps main and every copy through the mapping, not munmap */
 static int test_truncate(const struct backing *b, const char *name)
 {
@@ -283,46 +367,81 @@ static int test_memcg(const struct backing *b, const char *name)
 	return ok;
 }
 
-/* dynamic: reclaim moves a referenced main to its interleave home */
-static int test_dynamic(const struct backing *b, const char *name)
+/* pages whose main is in memory on another node than 0 */
+static unsigned long away(char *p, unsigned long n)
 {
-	unsigned long i, n = sz / PAGE < 16 ? sz / PAGE : 16, saved = sz;
-	int status[16], fd, filler, ok;
-	char val = 0, *p;
-	void *pages[16];
-
-	if (b->file != 1 || !getenv("REPL_TEST_DIR") || n < 2)
-		return -1; /* needs a disk fs, and a page off node 0 */
-	sz = n * PAGE;
-	sync();
-	write_file("/proc/sys/vm/drop_caches", "1");
-	set_placement("dynamic");
-	p = map(b, sz, &fd);
-	madvise(p, sz, MADV_RANDOM);
-	ok = run_steps(p, "w0 r*", &val);
-	madvise(p, sz, MADV_NORMAL);
-	msync(p, sz, MS_SYNC);
-	run_on_node(0);
-	madvise(p, sz, MADV_COLD);
-	filler = page_cache_filler(256);
-	reclaim_node(0, "64M swappiness=0");
-	print_stat(name);
+	void **pages = malloc(n * sizeof(*pages));
+	int *status = malloc(n * sizeof(*status));
+	unsigned long i, off = n;
 
 	for (i = 0; i < n; i++)
 		pages[i] = p + i * PAGE;
-	ok = ok && !syscall(SYS_move_pages, 0, n, pages, NULL, status, 0);
-	for (i = 0; ok && i < n; i++) {
-		if (status[i] == (int)(i % nodes))
-			continue;
-		ksft_print_msg("page %lu: node %d, want %lu\n", i, status[i],
-			       i % nodes);
-		ok = 0;
-	}
-	ok = ok && run_steps(p, "r* w1 r*", &val);
+	if (!syscall(SYS_move_pages, 0, n, pages, NULL, status, 0))
+		for (i = 0, off = 0; i < n; i++)
+			off += status[i] > 0;
+	free(pages);
+	free(status);
+	return off;
+}
+
+/*
+ * dynamic: reclaim moves a referenced main to its interleave home; restore
+ * brings it back, by the sysfs file or krepld, and the nodes that shared it
+ * copy it again
+ */
+static int test_dynamic(const struct backing *b, const char *name)
+{
+	const char *interval =
+		"/sys/kernel/mm/numa_replication/restore_interval";
+	unsigned long i, n = sz / PAGE, moved;
+	int fd, filler, install, kmsg, ok;
+	char val = 0, *p, pid[16];
+
+	if (!getenv("REPL_TEST_DIR") || n < 2)
+		return -1; /* swap and a disk fs from the scripts, a page off node 0 */
+
+	kmsg = open("/dev/kmsg", O_RDONLY | O_NONBLOCK);
+	lseek(kmsg, 0, SEEK_END);
+	sync();
+	write_file("/proc/sys/vm/drop_caches", "1");
+	write_file(interval, "0");
+	set_placement("dynamic");
+
+	p = map(b, sz, &fd);
+	ok = run_steps(p, "w0 r*", &val);
+	msync(p, sz, MS_SYNC);
+
+	run_on_node(0);
+	madvise(p, sz, MADV_COLD);
+	filler = page_cache_filler(256);
+	reclaim_node(0,
+		     b->file == 1 ? "64M swappiness=0" : "64M swappiness=max");
 	close(filler);
+	print_stat("reclaimed");
+	moved = away(p, n);
+	ok = ok && moved && run_steps(p, "r*", &val);
+
+	if (!strcmp(name, "restore")) {
+		snprintf(pid, sizeof(pid), "%d", getpid());
+		write_file("/sys/kernel/mm/numa_replication/restore", pid);
+	} else if (!strcmp(name, "restore: krepld")) {
+		write_file(interval, "1");
+		for (i = 0; i < 30 && away(p, n); i++)
+			usleep(100000);
+	}
+	if (strcmp(name, "dynamic")) {
+		print_stat("restored");
+		install = event_open("repl_install");
+		ok = ok && !away(p, n) && run_steps(p, "r*", &val);
+		ok = event_count(install) == moved && ok;
+	}
+
+	ok = ok && run_steps(p, "w1 r*", &val);
 	unmap(p, sz, fd);
+	ok = isolated_balanced(kmsg) && ok;
+	close(kmsg);
 	set_placement("bound");
-	sz = saved;
+	write_file(interval, "1");
 	return ok;
 }
 
@@ -332,7 +451,8 @@ int main(int argc, char **argv)
 
 	repl_test_init(argc, argv);
 	ksft_set_plan(ARRAY_SIZE(backings) *
-		      (7 + ARRAY_SIZE(writebacks) + ARRAY_SIZE(pwrites)));
+		      (9 + ARRAY_SIZE(writebacks) + ARRAY_SIZE(pwrites) +
+		       ARRAY_SIZE(sharer_writes)));
 	for (b = 0; b < ARRAY_SIZE(backings); b++) {
 		for (i = 0; i < ARRAY_SIZE(writebacks); i++)
 			run(test_writeback, &backings[b], writebacks[i]);
@@ -341,10 +461,14 @@ int main(int argc, char **argv)
 		run(test_pread, &backings[b], "pread");
 		run(test_truncate, &backings[b], "truncate");
 		run(test_pageout, &backings[b], "pageout");
+		for (i = 0; i < ARRAY_SIZE(sharer_writes); i++)
+			run(test_sharer_write, &backings[b], sharer_writes[i]);
 		run(test_ksm, &backings[b], "ksm");
 		run(test_aging, &backings[b], "aging");
 		run(test_memcg, &backings[b], "memcg reclaim");
 		run(test_dynamic, &backings[b], "dynamic");
+		run(test_dynamic, &backings[b], "restore");
+		run(test_dynamic, &backings[b], "restore: krepld");
 	}
 	ksft_finished();
 }
