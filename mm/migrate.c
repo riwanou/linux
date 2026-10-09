@@ -1206,9 +1206,11 @@ static void migrate_folio_undo_dst(struct folio *dst, bool locked,
 static void migrate_folio_done(struct folio *src,
 			       enum migrate_reason reason)
 {
-	if (likely(!page_has_movable_ops(&src->page)) && reason != MR_DEMOTION)
-		mod_node_page_state(folio_pgdat(src), NR_ISOLATED_ANON +
-				    folio_is_file_lru(src), -folio_nr_pages(src));
+	if (likely(!page_has_movable_ops(&src->page)) &&
+	    reason != MR_DEMOTION && reason != MR_NUMA_REPL_DEMOTION)
+		mod_node_page_state(folio_pgdat(src),
+				    NR_ISOLATED_ANON + folio_is_file_lru(src),
+				    -folio_nr_pages(src));
 
 	if (reason != MR_MEMORY_FAILURE)
 		/* We release the page in page_handle_poison. */
@@ -1831,7 +1833,8 @@ static int migrate_pages_batch(struct list_head *from,
 	int rc, rc_saved = 0, nr_pages;
 	LIST_HEAD(unmap_folios);
 	LIST_HEAD(dst_folios);
-	bool nosplit = (reason == MR_NUMA_MISPLACED);
+	bool nosplit = (reason == MR_NUMA_MISPLACED ||
+			reason == MR_NUMA_REPL_DEMOTION);
 
 	VM_WARN_ON_ONCE(mode != MIGRATE_ASYNC &&
 			!list_empty(from) && !list_is_singular(from));

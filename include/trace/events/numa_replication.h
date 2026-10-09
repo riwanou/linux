@@ -9,6 +9,8 @@
 #include <linux/tracepoint.h>
 
 #define repl_pfn_node(pfn) (pfn_valid(pfn) ? pfn_to_nid(pfn) : NUMA_NO_NODE)
+#define repl_pfn_dirty(pfn) \
+	(pfn_valid(pfn) && folio_test_dirty(page_folio(pfn_to_page(pfn))))
 
 /* clang-format off */
 DECLARE_EVENT_CLASS(repl,
@@ -20,6 +22,7 @@ DECLARE_EVENT_CLASS(repl,
 		__field(unsigned long, addr)
 		__field(unsigned long, pfn)
 		__field(int, pfn_node)
+		__field(bool, dirty)
 	),
 	TP_fast_assign(
 		__entry->node = node;
@@ -27,9 +30,11 @@ DECLARE_EVENT_CLASS(repl,
 		__entry->addr = addr;
 		__entry->pfn = pfn;
 		__entry->pfn_node = repl_pfn_node(pfn);
+		__entry->dirty = repl_pfn_dirty(pfn);
 	),
-	TP_printk("n%d %lx -> %lx(n%d)", __entry->node, __entry->addr,
-		  __entry->pfn, __entry->pfn_node)
+	TP_printk("n%d %lx -> %lx(n%d)%s", __entry->node, __entry->addr,
+		  __entry->pfn, __entry->pfn_node,
+		  __entry->dirty ? " dirty" : "")
 );
 
 #define DEFINE_REPL_EVENT(name)						\
@@ -41,9 +46,9 @@ DEFINE_EVENT(repl, name,						\
 DEFINE_EVENT_PRINT(repl, name,						\
 	TP_PROTO(int node, unsigned long addr, unsigned long pfn),	\
 	TP_ARGS(node, addr, pfn),					\
-	TP_printk("n%d %lx -> %lx(n%d) by n%d", __entry->node,		\
+	TP_printk("n%d %lx -> %lx(n%d)%s by n%d", __entry->node,	\
 		  __entry->addr, __entry->pfn, __entry->pfn_node,	\
-		  __entry->cpu_node))
+		  __entry->dirty ? " dirty" : "", __entry->cpu_node))
 
 DEFINE_REPL_EVENT(repl_install);
 DEFINE_REPL_EVENT(repl_share);
@@ -74,6 +79,7 @@ DECLARE_EVENT_CLASS(repl_move,
 		__field(int, src_node)
 		__field(unsigned long, dst)
 		__field(int, dst_node)
+		__field(bool, dirty)
 	),
 	TP_fast_assign(
 		__entry->cpu_node = numa_node_id();
@@ -82,10 +88,12 @@ DECLARE_EVENT_CLASS(repl_move,
 		__entry->src_node = repl_pfn_node(src);
 		__entry->dst = dst;
 		__entry->dst_node = repl_pfn_node(dst);
+		__entry->dirty = repl_pfn_dirty(dst);
 	),
-	TP_printk("n%d %lx %lx(n%d) -> %lx(n%d)", __entry->cpu_node,
+	TP_printk("n%d %lx %lx(n%d) -> %lx(n%d)%s", __entry->cpu_node,
 		  __entry->addr, __entry->src, __entry->src_node,
-		  __entry->dst, __entry->dst_node)
+		  __entry->dst, __entry->dst_node,
+		  __entry->dirty ? " dirty" : "")
 );
 
 DEFINE_EVENT(repl_move, repl_copy,
@@ -94,6 +102,23 @@ DEFINE_EVENT(repl_move, repl_copy,
 DEFINE_EVENT(repl_move, repl_migrate_done,
 	TP_PROTO(unsigned long addr, unsigned long src, unsigned long dst),
 	TP_ARGS(addr, src, dst));
+
+TRACE_EVENT(repl_restore,
+	TP_PROTO(int node, unsigned long size, unsigned long rss),
+	TP_ARGS(node, size, rss),
+	TP_STRUCT__entry(
+		__field(int, node)
+		__field(unsigned long, size)
+		__field(unsigned long, rss)
+	),
+	TP_fast_assign(
+		__entry->node = node;
+		__entry->size = size;
+		__entry->rss = rss;
+	),
+	TP_printk("n%d size %lu rss %lu", __entry->node, __entry->size,
+		  __entry->rss)
+);
 /* clang-format on */
 
 #endif

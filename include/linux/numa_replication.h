@@ -15,6 +15,8 @@ struct mm_repl {
 	pgd_t *pgds[REPL_MAX_NODES];
 	int main_nid;
 	unsigned long window; /* 512GB, 1 PGD */
+	bool degraded;
+	unsigned long size; /* rss before the pressure */
 };
 
 #ifdef CONFIG_NUMA_REPL
