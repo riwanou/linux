@@ -983,6 +983,19 @@ bool repl_referenced(struct vm_area_struct *vma, unsigned long addr,
 	return young;
 }
 
+/* @nid's tree maps its own page at @addr, not main's */
+static bool repl_has_copy(struct mm_struct *mm, int nid, unsigned long addr)
+{
+	pgd_t *pgd = mm->repl->pgds[nid];
+	pte_t pte;
+
+	if (!pgd || pgd == mm->pgd)
+		return false;
+	pte = repl_pte_read(mm, pgd, addr);
+	return pte_present(pte) &&
+	       pte_pfn(pte) != pte_pfn(repl_pte_read(mm, mm->pgd, addr));
+}
+
 /* the node main should move to under its placement policy, or NUMA_NO_NODE */
 int repl_check_placement(struct vm_area_struct *vma, unsigned long addr,
 			 struct folio *folio)
@@ -992,7 +1005,7 @@ int repl_check_placement(struct vm_area_struct *vma, unsigned long addr,
 	if (READ_ONCE(repl_main_placement) != REPL_MAIN_DYNAMIC)
 		return NUMA_NO_NODE;
 	nid = repl_interleave_nid(vma, addr, folio_order(folio));
-	if (nid == folio_nid(folio))
+	if (nid == folio_nid(folio) || repl_has_copy(vma->vm_mm, nid, addr))
 		return NUMA_NO_NODE;
 	repl_degrade(vma->vm_mm);
 	return nid;
