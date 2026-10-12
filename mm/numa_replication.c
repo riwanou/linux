@@ -505,6 +505,20 @@ static int repl_main_nid(struct vm_area_struct *vma, unsigned long addr)
 	return mm->repl->main_nid;
 }
 
+/* first loss under pressure: the footprint a restore rebuilds */
+static void repl_snapshot_size(struct mm_struct *mm)
+{
+	if (!READ_ONCE(mm->repl->size))
+		WRITE_ONCE(mm->repl->size, get_mm_rss(mm));
+}
+
+/* replication lost locality under pressure: krepld restores it later */
+static void repl_degrade(struct mm_struct *mm)
+{
+	WRITE_ONCE(mm->repl->degraded, true);
+	repl_snapshot_size(mm);
+}
+
 static vm_fault_t repl_install_main(struct vm_area_struct *vma,
 				    unsigned long addr, unsigned int flags,
 				    pmd_t *pmd, pte_t main)
@@ -585,6 +599,8 @@ static void repl_install_replica(struct vm_area_struct *vma, unsigned long addr,
 	if (!folio || !main_page ||
 	    page_to_nid(main_page) == folio_nid(folio)) {
 		trace_repl_share(numa_node_id(), addr, pte_pfn(main));
+		if (main_page && page_to_nid(main_page) != numa_node_id())
+			repl_degrade(vma->vm_mm);
 		set_pte_at(vma->vm_mm, addr, ptep, main);
 		return;
 	}
@@ -967,13 +983,6 @@ bool repl_referenced(struct vm_area_struct *vma, unsigned long addr,
 	return young;
 }
 
-/* first loss under pressure: the footprint a restore rebuilds */
-static void repl_snapshot_size(struct mm_struct *mm)
-{
-	if (!READ_ONCE(mm->repl->size))
-		WRITE_ONCE(mm->repl->size, get_mm_rss(mm));
-}
-
 /* the node main should move to under its placement policy, or NUMA_NO_NODE */
 int repl_check_placement(struct vm_area_struct *vma, unsigned long addr,
 			 struct folio *folio)
@@ -985,8 +994,7 @@ int repl_check_placement(struct vm_area_struct *vma, unsigned long addr,
 	nid = repl_interleave_nid(vma, addr, folio_order(folio));
 	if (nid == folio_nid(folio))
 		return NUMA_NO_NODE;
-	WRITE_ONCE(vma->vm_mm->repl->degraded, true);
-	repl_snapshot_size(vma->vm_mm);
+	repl_degrade(vma->vm_mm);
 	return nid;
 }
 
