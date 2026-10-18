@@ -867,13 +867,13 @@ static bool lru_gen_set_refs(struct folio *folio, const vma_flags_t *vma_flags)
 
 static enum folio_references folio_check_references(struct folio *folio,
 						    struct scan_control *sc,
-						    int *repl_migrate_nid)
+						    struct repl_move *repl_move)
 {
 	int referenced_ptes, referenced_folio;
 	vma_flags_t vma_flags;
 
 	referenced_ptes = folio_referenced(folio, 1, sc->target_mem_cgroup,
-					   &vma_flags, repl_migrate_nid);
+					   &vma_flags, repl_move);
 
 	/*
 	 * The supposedly reclaimable folio was found to be in a VM_LOCKED vma.
@@ -1079,7 +1079,7 @@ retry:
 		struct address_space *mapping;
 		struct folio *folio;
 		enum folio_references references = FOLIOREF_RECLAIM;
-		int repl_migrate_nid = NUMA_NO_NODE;
+		struct repl_move repl_move = {};
 		bool dirty, writeback;
 		unsigned int nr_pages;
 
@@ -1231,12 +1231,11 @@ retry:
 		}
 
 		if (!ignore_references)
-			references = folio_check_references(folio, sc,
-							    &repl_migrate_nid);
+			references = folio_check_references(folio, sc, &repl_move);
 
-		if (references != FOLIOREF_RECLAIM &&
-		    repl_migrate_nid != NUMA_NO_NODE &&
-		    repl_migrate_misplaced(folio, repl_migrate_nid)) {
+		if (repl_move.main_folio &&
+		    repl_migrate_misplaced(folio, &repl_move,
+					   references != FOLIOREF_RECLAIM)) {
 			/* moving main frees its node, not its cgroup's total */
 			if (!cgroup_reclaim(sc))
 				nr_reclaimed += nr_pages;

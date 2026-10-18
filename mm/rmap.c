@@ -915,7 +915,7 @@ struct folio_referenced_arg {
 	int referenced;
 	vma_flags_t vma_flags;
 	struct mem_cgroup *memcg;
-	int repl_migrate_nid;
+	struct repl_move repl_move;
 };
 
 /*
@@ -928,6 +928,9 @@ static bool folio_referenced_one(struct folio *folio,
 	DEFINE_FOLIO_VMA_WALK(pvmw, folio, vma, address, 0);
 	int ptes = 0, referenced = 0;
 	unsigned int nr;
+
+	if (addr_is_replicated(vma->vm_mm, address) && !pra->repl_move.main_folio)
+		repl_check_placement(vma, address, folio, &pra->repl_move);
 
 	while (page_vma_mapped_walk(&pvmw)) {
 		address = pvmw.address;
@@ -1003,8 +1006,6 @@ static bool folio_referenced_one(struct folio *folio,
 		if (pvmw.pte && addr_is_replicated(vma->vm_mm, address)) {
 			if (repl_referenced(vma, address, pvmw.pte, nr))
 				referenced++;
-			pra->repl_migrate_nid =
-				repl_check_placement(vma, address, folio);
 		}
 
 		ptes += nr;
@@ -1072,7 +1073,7 @@ static bool invalid_folio_referenced_vma(struct vm_area_struct *vma, void *arg)
  * @is_locked: Caller holds lock on the folio.
  * @memcg: target memory cgroup
  * @vma_flags: A combination of all the vma->flags which referenced the folio.
- * @repl_migrate_nid: Set to the node a replicated main should move to, or
+ * @repl_move: Set to the node a replicated main should move to, or
  *                    NUMA_NO_NODE. May be NULL.
  *
  * Quick test_and_clear_referenced for all mappings of a folio,
@@ -1082,13 +1083,13 @@ static bool invalid_folio_referenced_vma(struct vm_area_struct *vma, void *arg)
  */
 int folio_referenced(struct folio *folio, int is_locked,
 		     struct mem_cgroup *memcg, vma_flags_t *vma_flags,
-		     int *repl_migrate_nid)
+		     struct repl_move *repl_move)
 {
 	bool we_locked = false;
 	struct folio_referenced_arg pra = {
 		.mapcount = folio_mapcount(folio),
 		.memcg = memcg,
-		.repl_migrate_nid = NUMA_NO_NODE,
+		.repl_move = { .nid = NUMA_NO_NODE },
 	};
 	struct rmap_walk_control rwc = {
 		.rmap_one = folio_referenced_one,
@@ -1114,8 +1115,8 @@ int folio_referenced(struct folio *folio, int is_locked,
 
 	rmap_walk(folio, &rwc);
 	vma_flags_set_mask(vma_flags, pra.vma_flags);
-	if (repl_migrate_nid)
-		*repl_migrate_nid = pra.repl_migrate_nid;
+	if (repl_move)
+		*repl_move = pra.repl_move;
 
 	if (we_locked)
 		folio_unlock(folio);

@@ -705,6 +705,16 @@ static struct folio *repl_release_replica(struct vm_area_struct *vma, int nid,
 	return folio;
 }
 
+/* off the LRU onto @list, counted as isolated until it moves or goes back */
+static void repl_isolate(struct folio *folio, struct list_head *list)
+{
+	if (!folio_isolate_lru(folio))
+		return;
+	node_stat_mod_folio(folio, NR_ISOLATED_ANON + folio_is_file_lru(folio),
+			    folio_nr_pages(folio));
+	list_add_tail(&folio->lru, list);
+}
+
 static void repl_handle_rdprotect(struct vm_area_struct *vma, pgd_t *pgd,
 				  unsigned long addr, pte_t *ptep)
 {
@@ -983,32 +993,37 @@ bool repl_referenced(struct vm_area_struct *vma, unsigned long addr,
 	return young;
 }
 
-/* @nid's tree maps its own page at @addr, not main's */
-static bool repl_has_copy(struct mm_struct *mm, int nid, unsigned long addr)
+/* where main should move under its placement policy, the scanned folio being
+ * main itself or one of its replicas
+ */
+void repl_check_placement(struct vm_area_struct *vma, unsigned long addr,
+			  struct folio *folio, struct repl_move *repl_move)
 {
-	pgd_t *pgd = mm->repl->pgds[nid];
+	struct mm_struct *mm = vma->vm_mm;
+	struct folio *main;
+	bool is_main;
 	pte_t pte;
-
-	if (!pgd || pgd == mm->pgd)
-		return false;
-	pte = repl_pte_read(mm, pgd, addr);
-	return pte_present(pte) &&
-	       pte_pfn(pte) != pte_pfn(repl_pte_read(mm, mm->pgd, addr));
-}
-
-/* the node main should move to under its placement policy, or NUMA_NO_NODE */
-int repl_check_placement(struct vm_area_struct *vma, unsigned long addr,
-			 struct folio *folio)
-{
-	int nid;
+	int home_nid;
 
 	if (READ_ONCE(repl_main_placement) != REPL_MAIN_DYNAMIC)
-		return NUMA_NO_NODE;
-	nid = repl_interleave_nid(vma, addr, folio_order(folio));
-	if (nid == folio_nid(folio) || repl_has_copy(vma->vm_mm, nid, addr))
-		return NUMA_NO_NODE;
-	repl_degrade(vma->vm_mm);
-	return nid;
+		return;
+
+	pte = repl_pte_read(mm, mm->pgd, addr);
+	main = pte_present(pte) ? vm_normal_folio(vma, addr, pte) : NULL;
+	if (!main)
+		return;
+
+	home_nid = repl_interleave_nid(vma, addr, folio_order(main));
+	if (home_nid == folio_nid(main))
+		return;
+
+	is_main = main == folio;
+	if (!is_main && !folio_try_get(main))
+		return;
+
+	repl_move->main_folio = main;
+	repl_move->nid = home_nid;
+	repl_degrade(mm);
 }
 
 static struct folio *repl_move_alloc(struct folio *src, unsigned long nid)
@@ -1019,15 +1034,30 @@ static struct folio *repl_move_alloc(struct folio *src, unsigned long nid)
 	return __folio_alloc_node(gfp, folio_order(src), nid);
 }
 
-/* main moves to the node its placement policy picks for it */
-bool repl_migrate_misplaced(struct folio *folio, int nid)
+/* reclaim moves main: the scanned folio itself, or main of a scanned replica */
+bool repl_migrate_misplaced(struct folio *folio, struct repl_move *repl_move,
+			    bool keep)
 {
 	LIST_HEAD(list);
 
+	/* a replica on main's home: main migrates here, replica get thus reclaimed */
+	if (repl_move->main_folio != folio) {
+		repl_isolate(repl_move->main_folio, &list);
+		folio_put(repl_move->main_folio); /* isolation holds main now */
+		if (!list_empty(&list) &&
+		    migrate_pages(&list, repl_move_alloc, NULL, repl_move->nid,
+				  MIGRATE_ASYNC, MR_NUMA_MISPLACED, NULL))
+			putback_movable_pages(&list);
+		return false;
+	}
+
+	/* main itself, kept by reclaim: it moves instead */
+	if (!keep)
+		return false;
 	folio_unlock(folio);
 	list_add(&folio->lru, &list);
-	if (!migrate_pages(&list, repl_move_alloc, NULL, nid, MIGRATE_ASYNC,
-			   MR_NUMA_REPL_DEMOTION, NULL))
+	if (!migrate_pages(&list, repl_move_alloc, NULL, repl_move->nid,
+			   MIGRATE_ASYNC, MR_NUMA_REPL_DEMOTION, NULL))
 		return true;
 	list_del(&folio->lru);
 	folio_lock(folio);
@@ -1362,16 +1392,6 @@ static bool repl_restore_room(struct mm_struct *mm)
 	return repl_memcg_has_room(mm, need);
 }
 
-/* off the LRU onto @list, counted as isolated until it moves or goes back */
-static void repl_isolate(struct folio *folio, struct list_head *list)
-{
-	if (!folio_isolate_lru(folio))
-		return;
-	node_stat_mod_folio(folio, NR_ISOLATED_ANON + folio_is_file_lru(folio),
-			    folio_nr_pages(folio));
-	list_add_tail(&folio->lru, list);
-}
-
 /* main away from its home node is isolated to move back */
 static int repl_restore_main(pte_t *mainp, unsigned long addr,
 			     unsigned long next, struct mm_walk *walk)
@@ -1401,6 +1421,7 @@ static int repl_restore_sharers(pte_t *mainp, unsigned long addr,
 		folio = vm_normal_folio(vma, addr, main);
 	if (!folio)
 		return 0;
+	repl_sync_main(vma, addr, mainp);
 	for_each_repl_pgd(mm, nid, repl_pgd) {
 		if (repl_pgd == mm->pgd || nid == folio_nid(folio))
 			continue;
