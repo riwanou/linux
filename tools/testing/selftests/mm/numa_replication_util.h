@@ -125,6 +125,17 @@ static inline void write_file(const char *path, const char *val)
 	close(fd);
 }
 
+static inline void read_file(const char *path, char *val, size_t len)
+{
+	int fd = open(path, O_RDONLY);
+	ssize_t n = fd < 0 ? -1 : read(fd, val, len - 1);
+
+	if (n < 0)
+		ksft_exit_fail_msg("%s: %s\n", path, strerror(errno));
+	val[n] = '\0';
+	close(fd);
+}
+
 static inline long read_long(const char *path)
 {
 	long v = -1;
