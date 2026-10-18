@@ -90,10 +90,12 @@ pte_t repl_migrate_done(struct vm_area_struct *vma, unsigned long addr,
 void repl_mkclean_main(struct vm_area_struct *vma, unsigned long addr,
 		       pte_t *mainp);
 
-bool repl_referenced(struct vm_area_struct *vma, unsigned long addr,
-		     pte_t *mainp, unsigned int nr);
+bool repl_replicas_young(struct vm_area_struct *vma, unsigned long addr,
+			 pte_t *mainp, unsigned int nr);
 void repl_check_placement(struct vm_area_struct *vma, unsigned long addr,
 			  struct folio *folio, struct repl_move *repl_move);
+int repl_test_clear_replica_young(struct vm_area_struct *vma,
+				  unsigned long addr, struct folio *folio);
 bool repl_migrate_misplaced(struct folio *folio, struct repl_move *repl_move,
 			    bool keep);
 void repl_unmap_main(struct vm_area_struct *vma, unsigned long addr,
@@ -144,10 +146,12 @@ static inline pte_t repl_migrate_done(struct vm_area_struct *vma,
 static inline void repl_mkclean_main(struct vm_area_struct *vma, unsigned long addr,
 		       pte_t *mainp) {}
 
-static inline bool repl_referenced(struct vm_area_struct *vma, unsigned long addr,
-		     pte_t *mainp, unsigned int nr) { return false; }
+static inline bool repl_replicas_young(struct vm_area_struct *vma, unsigned long addr,
+			 pte_t *mainp, unsigned int nr) { return false; }
 static inline void repl_check_placement(struct vm_area_struct *vma, unsigned long addr,
 			  struct folio *folio, struct repl_move *repl_move) {}
+static inline int repl_test_clear_replica_young(struct vm_area_struct *vma,
+				  unsigned long addr, struct folio *folio) { return 0; }
 static inline bool repl_migrate_misplaced(struct folio *folio, struct repl_move *repl_move,
 			    bool keep) { return false; }
 static inline void repl_unmap_main(struct vm_area_struct *vma, unsigned long addr,
