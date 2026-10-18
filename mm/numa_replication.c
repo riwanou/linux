@@ -962,9 +962,9 @@ void repl_mkclean_main(struct vm_area_struct *vma, unsigned long addr,
 	}
 }
 
-/* aging: main is young if itself or any of its replicas was accessed */
-bool repl_referenced(struct vm_area_struct *vma, unsigned long addr,
-		     pte_t *mainp, unsigned int nr)
+/* main is in use through a replica or sharer that was accessed */
+bool repl_replicas_young(struct vm_area_struct *vma, unsigned long addr,
+			 pte_t *mainp, unsigned int nr)
 {
 	struct mm_struct *mm = vma->vm_mm;
 	unsigned long start = addr;
@@ -1005,6 +1005,8 @@ void repl_check_placement(struct vm_area_struct *vma, unsigned long addr,
 	pte_t pte;
 	int home_nid;
 
+	if (!repl_move || repl_move->main_folio)
+		return;
 	if (READ_ONCE(repl_main_placement) != REPL_MAIN_DYNAMIC)
 		return;
 
@@ -1026,6 +1028,24 @@ void repl_check_placement(struct vm_area_struct *vma, unsigned long addr,
 	repl_degrade(mm);
 }
 
+/* a replica is aged by its own pte, which the rmap walk never sees */
+int repl_test_clear_replica_young(struct vm_area_struct *vma,
+				  unsigned long addr, struct folio *folio)
+{
+	struct mm_struct *mm = vma->vm_mm;
+	pte_t *ptep;
+	int young;
+
+	if (pte_pfn(repl_pte_read(mm, mm->pgd, addr)) == folio_pfn(folio))
+		return 0;
+	ptep = repl_pte_map(mm, mm->repl->pgds[folio_nid(folio)], addr);
+	if (!ptep)
+		return 0;
+	young = ptep_test_and_clear_young(vma, addr, ptep);
+	pte_unmap(ptep);
+	return young;
+}
+
 static struct folio *repl_move_alloc(struct folio *src, unsigned long nid)
 {
 	gfp_t gfp = (GFP_HIGHUSER_MOVABLE & ~__GFP_RECLAIM) | __GFP_THISNODE |
@@ -1042,6 +1062,10 @@ bool repl_migrate_misplaced(struct folio *folio, struct repl_move *repl_move,
 
 	/* a replica on main's home: main migrates here, replica get thus reclaimed */
 	if (repl_move->main_folio != folio) {
+		if (keep) {
+			folio_put(repl_move->main_folio);
+			return false;
+		}
 		repl_isolate(repl_move->main_folio, &list);
 		folio_put(repl_move->main_folio); /* isolation holds main now */
 		if (!list_empty(&list) &&
