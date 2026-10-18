@@ -10,6 +10,12 @@
 #define REPL_MAX_NODES 16
 #endif
 
+/* what reclaim should move: main's folio to @nid */
+struct repl_move {
+	struct folio *main_folio;
+	int nid;
+};
+
 struct mm_repl {
 	nodemask_t nodes;
 	pgd_t *pgds[REPL_MAX_NODES];
@@ -86,9 +92,10 @@ void repl_mkclean_main(struct vm_area_struct *vma, unsigned long addr,
 
 bool repl_referenced(struct vm_area_struct *vma, unsigned long addr,
 		     pte_t *mainp, unsigned int nr);
-int repl_check_placement(struct vm_area_struct *vma, unsigned long addr,
-			 struct folio *folio);
-bool repl_migrate_misplaced(struct folio *folio, int nid);
+void repl_check_placement(struct vm_area_struct *vma, unsigned long addr,
+			  struct folio *folio, struct repl_move *repl_move);
+bool repl_migrate_misplaced(struct folio *folio, struct repl_move *repl_move,
+			    bool keep);
 void repl_unmap_main(struct vm_area_struct *vma, unsigned long addr,
 		     pte_t *mainp);
 bool repl_unmap_replica(struct vm_area_struct *vma, unsigned long addr,
@@ -139,9 +146,10 @@ static inline void repl_mkclean_main(struct vm_area_struct *vma, unsigned long a
 
 static inline bool repl_referenced(struct vm_area_struct *vma, unsigned long addr,
 		     pte_t *mainp, unsigned int nr) { return false; }
-static inline int repl_check_placement(struct vm_area_struct *vma, unsigned long addr,
-			 struct folio *folio) { return NUMA_NO_NODE; }
-static inline bool repl_migrate_misplaced(struct folio *folio, int nid) { return false; }
+static inline void repl_check_placement(struct vm_area_struct *vma, unsigned long addr,
+			  struct folio *folio, struct repl_move *repl_move) {}
+static inline bool repl_migrate_misplaced(struct folio *folio, struct repl_move *repl_move,
+			    bool keep) { return false; }
 static inline void repl_unmap_main(struct vm_area_struct *vma, unsigned long addr,
 		     pte_t *mainp) {}
 static inline bool repl_unmap_replica(struct vm_area_struct *vma, unsigned long addr,
