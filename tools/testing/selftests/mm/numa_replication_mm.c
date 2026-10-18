@@ -367,81 +367,90 @@ static int test_memcg(const struct backing *b, const char *name)
 	return ok;
 }
 
-/* pages whose main is in memory on another node than 0 */
-static unsigned long away(char *p, unsigned long n)
+static unsigned long on_node(char *p, int nid)
 {
+	unsigned long i, n = sz / PAGE, count = 0;
 	void **pages = malloc(n * sizeof(*pages));
 	int *status = malloc(n * sizeof(*status));
-	unsigned long i, off = n;
 
 	for (i = 0; i < n; i++)
 		pages[i] = p + i * PAGE;
 	if (!syscall(SYS_move_pages, 0, n, pages, NULL, status, 0))
-		for (i = 0, off = 0; i < n; i++)
-			off += status[i] > 0;
+		for (i = 0; i < n; i++)
+			count += status[i] == nid;
 	free(pages);
 	free(status);
-	return off;
+	return count;
 }
 
-/*
- * dynamic: reclaim moves a referenced main to its interleave home; restore
- * brings it back, by the sysfs file or krepld, and the nodes that shared it
- * copy it again
- */
+static unsigned long away(char *p)
+{
+	unsigned long count = 0;
+	int nid;
+
+	for (nid = 1; nid < nodes; nid++)
+		count += on_node(p, nid);
+	return count;
+}
+
+static int expect(int cond, const char *what)
+{
+	if (!cond)
+		ksft_print_msg("expected: %s\n", what);
+	return cond;
+}
+
+/* under reclaim, main interleaves; restore undoes it */
 static int test_dynamic(const struct backing *b, const char *name)
 {
 	const char *interval =
 		"/sys/kernel/mm/numa_replication/restore_interval";
-	unsigned long i, n = sz / PAGE, moved;
-	int fd, filler, install, kmsg, ok;
-	char val = 0, *p, pid[16];
+	const char *room = "/sys/kernel/mm/numa_replication/free_percent";
+	char val = 0, *p, pid[16], saved_interval[16], saved_room[16];
+	int fd, kmsg, nid, done, i, ok;
 
-	if (!getenv("REPL_TEST_DIR") || n < 2)
-		return -1; /* swap and a disk fs from the scripts, a page off node 0 */
-
+	if (!getenv("REPL_TEST_DIR") || nodes < 4)
+		return -1;
+	read_file(interval, saved_interval, sizeof(saved_interval));
+	read_file(room, saved_room, sizeof(saved_room));
 	kmsg = open("/dev/kmsg", O_RDONLY | O_NONBLOCK);
 	lseek(kmsg, 0, SEEK_END);
-	sync();
-	write_file("/proc/sys/vm/drop_caches", "1");
 	write_file(interval, "0");
+	write_file(room, "0");
 	set_placement("dynamic");
-
 	p = map(b, sz, &fd);
+
 	ok = run_steps(p, "w0 r*", &val);
-	msync(p, sz, MS_SYNC);
+	write_file("/proc/sys/vm/drop_caches", "1");
+	done = event_open("repl_migrate_done");
+	for (nid = 3; nid < nodes; nid++)
+		reclaim_node(nid, "1G swappiness=0");
+	ksft_print_msg("moved %ld, on node 1 %lu, node 2 %lu, away %lu\n",
+		       event_count(done), on_node(p, 1), on_node(p, 2),
+		       away(p));
+	ok = ok && expect(event_count(done), "a replica reclaim moved main") &&
+	     expect(on_node(p, 1), "main on node 1") &&
+	     expect(on_node(p, 2), "main on node 2");
+	print_stat(name);
 
-	run_on_node(0);
-	madvise(p, sz, MADV_COLD);
-	filler = page_cache_filler(256);
-	reclaim_node(0,
-		     b->file == 1 ? "64M swappiness=0" : "64M swappiness=max");
-	close(filler);
-	print_stat("reclaimed");
-	moved = away(p, n);
-	ok = ok && moved && run_steps(p, "r*", &val);
-
-	if (!strcmp(name, "restore")) {
+	if (!strcmp(name, "dynamic: restore")) {
 		snprintf(pid, sizeof(pid), "%d", getpid());
 		write_file("/sys/kernel/mm/numa_replication/restore", pid);
-	} else if (!strcmp(name, "restore: krepld")) {
+	} else if (!strcmp(name, "dynamic: krepld")) {
 		write_file(interval, "1");
-		for (i = 0; i < 30 && away(p, n); i++)
+		for (i = 0; i < 30 && away(p); i++)
 			usleep(100000);
 	}
-	if (strcmp(name, "dynamic")) {
-		print_stat("restored");
-		install = event_open("repl_install");
-		ok = ok && !away(p, n) && run_steps(p, "r*", &val);
-		ok = event_count(install) == moved && ok;
-	}
+	if (strcmp(name, "dynamic"))
+		ok = ok && expect(!away(p), "main back on node 0");
+	ok = ok && run_steps(p, "r* w1 r*", &val);
 
-	ok = ok && run_steps(p, "w1 r*", &val);
 	unmap(p, sz, fd);
 	ok = isolated_balanced(kmsg) && ok;
 	close(kmsg);
 	set_placement("bound");
-	write_file(interval, "1");
+	write_file(interval, saved_interval);
+	write_file(room, saved_room);
 	return ok;
 }
 
@@ -467,8 +476,8 @@ int main(int argc, char **argv)
 		run(test_aging, &backings[b], "aging");
 		run(test_memcg, &backings[b], "memcg reclaim");
 		run(test_dynamic, &backings[b], "dynamic");
-		run(test_dynamic, &backings[b], "restore");
-		run(test_dynamic, &backings[b], "restore: krepld");
+		run(test_dynamic, &backings[b], "dynamic: restore");
+		run(test_dynamic, &backings[b], "dynamic: krepld");
 	}
 	ksft_finished();
 }
