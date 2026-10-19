@@ -1079,7 +1079,9 @@ retry:
 		struct address_space *mapping;
 		struct folio *folio;
 		enum folio_references references = FOLIOREF_RECLAIM;
-		struct repl_move repl_move = {};
+		struct repl_move repl_move = {
+			.pressure = sc->priority < DEF_PRIORITY - 4,
+		};
 		bool dirty, writeback;
 		unsigned int nr_pages;
 
@@ -1233,12 +1235,11 @@ retry:
 		if (!ignore_references)
 			references = folio_check_references(folio, sc, &repl_move);
 
-		if (repl_move.main_folio &&
+    if (repl_move.main_folio && repl_move.main_folio != folio &&
 		    repl_migrate_misplaced(folio, &repl_move,
 					   references != FOLIOREF_RECLAIM)) {
-			/* moving main frees its node, not its cgroup's total */
-			if (!cgroup_reclaim(sc))
-				nr_reclaimed += nr_pages;
+			/* moving main drops the copy on its new node */
+			nr_reclaimed += nr_pages;
 			continue;
 		}
 

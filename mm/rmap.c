@@ -931,7 +931,8 @@ static bool folio_referenced_one(struct folio *folio,
 
 	if (addr_is_replicated(vma->vm_mm, address)) {
 		repl_check_placement(vma, address, folio, pra->repl_move);
-		referenced += repl_test_clear_replica_young(vma, address, folio);
+		referenced += repl_test_clear_replica_young(vma, address, folio,
+							    pra->repl_move);
 	}
 
 	while (page_vma_mapped_walk(&pvmw)) {

@@ -14,6 +14,7 @@
 struct repl_move {
 	struct folio *main_folio;
 	int nid;
+	bool pressure;
 };
 
 struct mm_repl {
@@ -95,7 +96,8 @@ bool repl_replicas_young(struct vm_area_struct *vma, unsigned long addr,
 void repl_check_placement(struct vm_area_struct *vma, unsigned long addr,
 			  struct folio *folio, struct repl_move *repl_move);
 int repl_test_clear_replica_young(struct vm_area_struct *vma,
-				  unsigned long addr, struct folio *folio);
+				  unsigned long addr, struct folio *folio,
+				  struct repl_move *repl_move);
 bool repl_migrate_misplaced(struct folio *folio, struct repl_move *repl_move,
 			    bool keep);
 void repl_unmap_main(struct vm_area_struct *vma, unsigned long addr,
@@ -151,7 +153,8 @@ static inline bool repl_replicas_young(struct vm_area_struct *vma, unsigned long
 static inline void repl_check_placement(struct vm_area_struct *vma, unsigned long addr,
 			  struct folio *folio, struct repl_move *repl_move) {}
 static inline int repl_test_clear_replica_young(struct vm_area_struct *vma,
-				  unsigned long addr, struct folio *folio) { return 0; }
+				  unsigned long addr, struct folio *folio,
+				  struct repl_move *repl_move) { return 0; }
 static inline bool repl_migrate_misplaced(struct folio *folio, struct repl_move *repl_move,
 			    bool keep) { return false; }
 static inline void repl_unmap_main(struct vm_area_struct *vma, unsigned long addr,

@@ -1030,12 +1030,15 @@ void repl_check_placement(struct vm_area_struct *vma, unsigned long addr,
 
 /* a replica is aged by its own pte, which the rmap walk never sees */
 int repl_test_clear_replica_young(struct vm_area_struct *vma,
-				  unsigned long addr, struct folio *folio)
+				  unsigned long addr, struct folio *folio,
+				  struct repl_move *repl_move)
 {
 	struct mm_struct *mm = vma->vm_mm;
 	pte_t *ptep;
 	int young;
 
+	if (!repl_move || repl_move->pressure)
+		return 0;
 	if (pte_pfn(repl_pte_read(mm, mm->pgd, addr)) == folio_pfn(folio))
 		return 0;
 	ptep = repl_pte_map(mm, mm->repl->pgds[folio_nid(folio)], addr);
@@ -1258,7 +1261,9 @@ vm_fault_t repl_handle_mm_fault(struct vm_area_struct *vma, unsigned long addr,
 	pte_t main;
 	vm_fault_t ret;
 
+	old = repl_push_alloc_node(mm->repl->main_nid, MPOL_PREFERRED);
 	main_pmd = repl_alloc_pgtables(mm, mm->pgd, addr);
+	repl_pop_alloc_node(old);
 	if (!main_pmd)
 		return VM_FAULT_OOM;
 	main = repl_pte_read(mm, mm->pgd, addr);
