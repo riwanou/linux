@@ -42,6 +42,8 @@ static int repl_main_placement = REPL_MAIN_BOUND;
 static unsigned int repl_restore_interval = 1;
 static unsigned int repl_free_percent = 10;
 
+static bool repl_write_unreplication;
+
 static char repl_files[8][128];
 static DEFINE_MUTEX(repl_files_lock);
 
@@ -609,6 +611,11 @@ static void repl_install_replica(struct vm_area_struct *vma, unsigned long addr,
 	/* stale main: skip the copy, repl_handle_rdprotect refreshes it next */
 	if (!repl_pte_rdprotected(main)) {
 		repl_wrprotect_all(vma, addr);
+		if (READ_ONCE(repl_write_unreplication) && pte_dirty(main)) {
+			folio_mark_dirty(page_folio(main_page));
+			main = pte_mkclean(ptep_clear_flush(vma, addr, mainp));
+			set_pte_at(vma->vm_mm, addr, mainp, main);
+		}
 		repl_copy(vma, addr, folio_page(folio, 0), main_page);
 	}
 	__folio_mark_uptodate(folio);
@@ -770,6 +777,39 @@ static void repl_sync_main(struct vm_area_struct *vma, unsigned long addr,
 	folio_mark_dirty(page_folio(vm_normal_page(vma, addr, main)));
 }
 
+static void repl_drop_pte(struct vm_area_struct *vma, int nid,
+			  unsigned long addr, pte_t *ptep,
+			  unsigned long main_pfn)
+{
+	struct page *page;
+	pte_t pte = ptep_get(ptep);
+
+	if (!pte_present(pte))
+		return;
+	pte = ptep_clear_flush(vma, addr, ptep);
+	page = vm_normal_page(vma, addr, pte);
+	if (pte_pfn(pte) == main_pfn) {
+		/* a write through the sharer dirtied main's folio */
+		if (page && pte_dirty(pte))
+			folio_mark_dirty(page_folio(page));
+		trace_repl_unshare(nid, addr, main_pfn);
+	} else if (page) {
+		folio_put(repl_release_replica(vma, nid, addr, page));
+	}
+}
+
+static void repl_drop(struct vm_area_struct *vma, int nid, unsigned long addr,
+		      unsigned long main_pfn)
+{
+	pte_t *ptep =
+		repl_pte_map(vma->vm_mm, vma->vm_mm->repl->pgds[nid], addr);
+
+	if (!ptep)
+		return;
+	repl_drop_pte(vma, nid, addr, ptep, main_pfn);
+	pte_unmap(ptep);
+}
+
 static void repl_handle_write(struct vm_area_struct *vma, pgd_t *pgd,
 			      unsigned long addr, pte_t *ptep)
 {
@@ -786,6 +826,58 @@ static void repl_handle_write(struct vm_area_struct *vma, pgd_t *pgd,
 	trace_repl_write(numa_node_id(), addr, pfn);
 	if (ptep_set_access_flags(vma, addr, ptep, pte, 1))
 		update_mmu_cache(vma, addr, ptep);
+}
+
+/* another node wrote this page before: its pte kept the dirty bit */
+static bool repl_cross_written(struct vm_area_struct *vma, pgd_t *pgd,
+			       unsigned long addr)
+{
+	struct mm_struct *mm = vma->vm_mm;
+	pgd_t *repl_pgd;
+	pte_t pte;
+	int nid;
+
+	if (!READ_ONCE(repl_write_unreplication))
+		return false;
+	for_each_repl_pgd(mm, nid, repl_pgd) {
+		if (repl_pgd == pgd)
+			continue;
+		pte = repl_pte_read(mm, repl_pgd, addr);
+		if (pte_present(pte) && pte_dirty(pte))
+			return true;
+	}
+	return false;
+}
+
+/* written from several nodes: copies become sharers, all writable */
+static void repl_unreplicate(struct vm_area_struct *vma, unsigned long addr,
+			     pte_t *mainp)
+{
+	struct mm_struct *mm = vma->vm_mm;
+	pte_t *ptep, pte, shared;
+	pgd_t *repl_pgd;
+	int nid;
+
+	trace_repl_unreplicate(mm->repl->main_nid, addr,
+			       pte_pfn(ptep_get(mainp)));
+
+	repl_sync_main(vma, addr, mainp);
+	shared = pte_mkdirty(maybe_mkwrite(ptep_get(mainp), vma));
+
+	for_each_repl_pgd(mm, nid, repl_pgd) {
+		ptep = repl_pte_map(mm, repl_pgd, addr);
+		if (!ptep)
+			continue;
+		pte = ptep_get(ptep);
+		if (pte_present(pte) && pte_pfn(pte) != pte_pfn(shared)) {
+			repl_drop_pte(vma, nid, addr, ptep, pte_pfn(shared));
+			set_pte_at(mm, addr, ptep, shared);
+		} else if (pte_present(pte) &&
+			   ptep_set_access_flags(vma, addr, ptep, shared, 1)) {
+			update_mmu_cache(vma, addr, ptep);
+		}
+		pte_unmap(ptep);
+	}
 }
 
 bool repl_zap_replicas(struct mmu_gather *tlb, struct vm_area_struct *vma,
@@ -841,34 +933,6 @@ bool repl_zap_replicas(struct mmu_gather *tlb, struct vm_area_struct *vma,
 	}
 
 	return full;
-}
-
-static void repl_drop(struct vm_area_struct *vma, int nid, unsigned long addr,
-		      unsigned long main_pfn)
-{
-	struct mm_struct *mm = vma->vm_mm;
-	struct page *page;
-	pte_t *ptep, pte;
-
-	ptep = repl_pte_map(mm, mm->repl->pgds[nid], addr);
-	if (!ptep)
-		return;
-
-	pte = ptep_get(ptep);
-	if (pte_present(pte)) {
-		pte = ptep_clear_flush(vma, addr, ptep);
-		page = vm_normal_page(vma, addr, pte);
-		if (pte_pfn(pte) == main_pfn) {
-			/* a write through the sharer dirtied main's folio */
-			if (page && pte_dirty(pte))
-				folio_mark_dirty(page_folio(page));
-			trace_repl_unshare(nid, addr, main_pfn);
-		} else if (page) {
-			folio_put(repl_release_replica(vma, nid, addr, page));
-		}
-	}
-
-	pte_unmap(ptep);
 }
 
 /* a write through a sharer dirtied main's page: its folio has to know */
@@ -1234,6 +1298,8 @@ static vm_fault_t repl_handle_pte_fault(struct vm_area_struct *vma, pgd_t *pgd,
 
 	if (pte_none(ptep_get(ptep)))
 		repl_install_replica(vma, addr, mainp, ptep, prealloc_folio);
+	if (write && repl_cross_written(vma, pgd, addr))
+		repl_unreplicate(vma, addr, mainp);
 	if (repl_pte_rdprotected(ptep_get(ptep)))
 		repl_handle_rdprotect(vma, pgd, addr, ptep);
 	if (write)
@@ -1640,6 +1706,28 @@ static ssize_t restore_interval_store(struct kobject *kobj,
 static struct kobj_attribute restore_interval_attr =
 	__ATTR_RW(restore_interval);
 
+static ssize_t write_unreplication_show(struct kobject *kobj,
+					struct kobj_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%d\n", READ_ONCE(repl_write_unreplication));
+}
+
+static ssize_t write_unreplication_store(struct kobject *kobj,
+					 struct kobj_attribute *attr,
+					 const char *buf, size_t count)
+{
+	bool v;
+	int ret = kstrtobool(buf, &v);
+
+	if (ret)
+		return ret;
+	WRITE_ONCE(repl_write_unreplication, v);
+	return count;
+}
+
+static struct kobj_attribute write_unreplication_attr =
+	__ATTR_RW(write_unreplication);
+
 static ssize_t files_show(struct kobject *kobj, struct kobj_attribute *attr,
 			  char *buf)
 {
@@ -1680,9 +1768,13 @@ out:
 static struct kobj_attribute files_attr = __ATTR_RW(files);
 
 static struct attribute *repl_attrs[] = {
-	&restore_attr.attr,	 &main_placement_attr.attr,
-	&free_percent_attr.attr, &restore_interval_attr.attr,
-	&files_attr.attr,	 NULL,
+	&restore_attr.attr,
+	&main_placement_attr.attr,
+	&free_percent_attr.attr,
+	&restore_interval_attr.attr,
+	&files_attr.attr,
+	&write_unreplication_attr.attr,
+	NULL,
 };
 static const struct attribute_group repl_attr_group = {
 	.name = "numa_replication",
