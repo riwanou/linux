@@ -68,6 +68,7 @@ DEFINE_REPL_REMOTE_EVENT(repl_referenced);
 DEFINE_REPL_REMOTE_EVENT(repl_unmap_main);
 DEFINE_REPL_REMOTE_EVENT(repl_unmap_replica);
 DEFINE_REPL_REMOTE_EVENT(repl_unshare);
+DEFINE_REPL_REMOTE_EVENT(repl_unreplicate);
 
 DECLARE_EVENT_CLASS(repl_move,
 	TP_PROTO(unsigned long addr, unsigned long src, unsigned long dst),
