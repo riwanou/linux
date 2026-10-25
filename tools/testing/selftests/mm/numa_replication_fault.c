@@ -337,12 +337,42 @@ static int test_dynamic_full(const struct backing *b, const char *name)
 	return ok;
 }
 
+/* a write after a read elsewhere shares the page; a first write does not */
+static int unrepl(const struct backing *b, const char *steps, long want)
+{
+	const char *knob =
+		"/sys/kernel/mm/numa_replication/write_unreplication";
+	int unreplicated = event_open("repl_unreplicate");
+	char val = 0, *p;
+	int fd, ok;
+	long n;
+
+	write_file(knob, "1");
+	p = map(b, sz, &fd);
+	ok = run_steps(p, steps, &val);
+	n = event_count(unreplicated);
+	unmap(p, sz, fd);
+	write_file(knob, "0");
+	ksft_print_msg("%ld pages unreplicated, want %ld\n", n, want);
+	return ok && n == want;
+}
+
+static int test_unrepl(const struct backing *b, const char *name)
+{
+	return unrepl(b, "r* w1 wL", sz / PAGE);
+}
+
+static int test_unrepl_one_writer(const struct backing *b, const char *name)
+{
+	return unrepl(b, "r* w1 r* w1 r*", 0);
+}
+
 int main(int argc, char **argv)
 {
 	unsigned int b, i;
 
 	repl_test_init(argc, argv);
-	ksft_set_plan(ARRAY_SIZE(backings) * (9 + ARRAY_SIZE(protocols)));
+	ksft_set_plan(ARRAY_SIZE(backings) * (11 + ARRAY_SIZE(protocols)));
 	for (b = 0; b < ARRAY_SIZE(backings); b++) {
 		for (i = 0; i < ARRAY_SIZE(protocols); i++)
 			run(test_protocol, &backings[b], protocols[i]);
@@ -356,6 +386,8 @@ int main(int argc, char **argv)
 		run(test_main_placement, &backings[b], "bound");
 		run(test_main_placement, &backings[b], "first_touch");
 		run(test_main_placement, &backings[b], "interleave");
+		run(test_unrepl, &backings[b], "unrepl");
+		run(test_unrepl_one_writer, &backings[b], "unrepl: one writer");
 	}
 	ksft_finished();
 }
