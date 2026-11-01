@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
@@ -16,6 +17,8 @@
 #include <linux/perf_event.h>
 
 #include "kselftest.h"
+
+#define REPL_SYSFS "/sys/kernel/mm/numa_replication/"
 
 #ifndef MPOL_MF_MOVE
 #define MPOL_MF_MOVE (1 << 1)
@@ -31,6 +34,7 @@
 static unsigned long sz __maybe_unused = 64UL << 20;
 static const char *filter __maybe_unused;
 static int nodes __maybe_unused;
+static int stat_quiet; /* repeat prints once, not every pass */
 
 struct backing {
 	const char *name;
@@ -235,7 +239,7 @@ static inline void print_stat(const char *when)
 	char line[256];
 	FILE *f;
 
-	if (strcmp(getenv("REPL_STAT") ?: "", "1"))
+	if (stat_quiet || strcmp(getenv("REPL_STAT") ?: "", "1"))
 		return;
 	f = fopen("/proc/self/numa_repl_stat", "r");
 	if (!f)
@@ -339,6 +343,8 @@ static inline int run_steps(char *p, const char *steps, char *val)
 				return 0;
 			} else if (tok[0] == 'x')
 				reclaim_node(n, "1G");
+			else if (tok[0] == 's')
+				sleep(n);
 		}
 		print_stat(tok);
 	}
