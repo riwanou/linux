@@ -8,6 +8,7 @@
 #include <linux/seq_file.h>
 #include <linux/migrate.h>
 #include <linux/kthread.h>
+#include <linux/sched/cputime.h>
 
 #include <asm/pgalloc.h>
 #include <asm/tlb.h>
@@ -42,7 +43,15 @@ static int repl_main_placement = REPL_MAIN_BOUND;
 static unsigned int repl_restore_interval = 1;
 static unsigned int repl_free_percent = 10;
 
+static const char *const states[] = { "replicated", "shared", "trial" };
 static bool repl_write_unreplication;
+/* percent: replicated reads vs interleaved */
+static unsigned int repl_read_speedup = 200;
+static unsigned int repl_write_retry_interval = 60;
+/* seconds over budget in a row before sharing: one costly second is a burst */
+#define REPL_SHARE_TICKS 3
+/* seconds under budget on trial before mains go home: moving them is costly */
+#define REPL_HOME_TICKS 8
 
 static char repl_files[8][128];
 static DEFINE_MUTEX(repl_files_lock);
@@ -480,15 +489,19 @@ static pmd_t *repl_alloc_pgtables(struct mm_struct *mm, pgd_t *pgd,
 	return pmd;
 }
 
+static int repl_nth_node(unsigned long n)
+{
+	int nid = first_online_node;
+
+	for (n %= num_online_nodes(); n; n--)
+		nid = next_online_node(nid);
+	return nid;
+}
+
 static int repl_interleave_nid(struct vm_area_struct *vma, unsigned long addr,
 			       unsigned int order)
 {
-	int nid = first_online_node, n;
-
-	n = (linear_page_index(vma, addr) >> order) % num_online_nodes();
-	for (; n; n--)
-		nid = next_online_node(nid);
-	return nid;
+	return repl_nth_node(linear_page_index(vma, addr) >> order);
 }
 
 static int repl_main_nid(struct vm_area_struct *vma, unsigned long addr)
@@ -504,6 +517,10 @@ static int repl_main_nid(struct vm_area_struct *vma, unsigned long addr)
 		if (!repl_has_room(mm, mm->repl->main_nid))
 			return repl_interleave_nid(vma, addr, 0);
 	}
+
+	if (READ_ONCE(mm->repl->state) != REPL_REPLICATED)
+		return repl_interleave_nid(vma, addr, 0);
+
 	return mm->repl->main_nid;
 }
 
@@ -512,6 +529,12 @@ static void repl_snapshot_size(struct mm_struct *mm)
 {
 	if (!READ_ONCE(mm->repl->size))
 		WRITE_ONCE(mm->repl->size, get_mm_rss(mm));
+}
+
+/* time spent keeping replicas coherent: what krepld weighs against the process */
+static void repl_cost_add(struct mm_struct *mm, u64 start)
+{
+	atomic64_add(ktime_get_ns() - start, &mm->repl->cost_ns);
 }
 
 /* replication lost locality under pressure: krepld restores it later */
@@ -589,16 +612,17 @@ static void repl_wrprotect_all(struct vm_area_struct *vma, unsigned long addr)
 }
 
 static void repl_install_replica(struct vm_area_struct *vma, unsigned long addr,
-				 pte_t *mainp, pte_t *ptep,
+				 pte_t *mainp, pte_t *ptep, bool write,
 				 struct folio **prealloc_folio)
 {
 	struct folio *folio = *prealloc_folio;
 	pte_t main = ptep_get(mainp), pte;
 	struct page *main_page = vm_normal_page(vma, addr, main);
+	bool share = READ_ONCE(vma->vm_mm->repl->state) == REPL_SHARED && write;
 
 	VM_WARN_ON_ONCE(ptep == mainp);
 
-	if (!folio || !main_page ||
+	if (share || !folio || !main_page ||
 	    page_to_nid(main_page) == folio_nid(folio)) {
 		trace_repl_share(numa_node_id(), addr, pte_pfn(main));
 		if (main_page && page_to_nid(main_page) != numa_node_id())
@@ -611,11 +635,6 @@ static void repl_install_replica(struct vm_area_struct *vma, unsigned long addr,
 	/* stale main: skip the copy, repl_handle_rdprotect refreshes it next */
 	if (!repl_pte_rdprotected(main)) {
 		repl_wrprotect_all(vma, addr);
-		if (READ_ONCE(repl_write_unreplication) && pte_dirty(main)) {
-			folio_mark_dirty(page_folio(main_page));
-			main = pte_mkclean(ptep_clear_flush(vma, addr, mainp));
-			set_pte_at(vma->vm_mm, addr, mainp, main);
-		}
 		repl_copy(vma, addr, folio_page(folio, 0), main_page);
 	}
 	__folio_mark_uptodate(folio);
@@ -632,9 +651,10 @@ static void repl_install_replica(struct vm_area_struct *vma, unsigned long addr,
 	update_mmu_cache(vma, addr, ptep);
 }
 
-static bool repl_folio_lock_dirty(struct folio *folio)
+static bool repl_folio_lock_dirty(struct folio *folio, bool *held)
 {
-	if (!folio_trylock(folio))
+	*held = !folio_trylock(folio);
+	if (*held)
 		return false;
 	if (folio_test_dirty(folio))
 		return true;
@@ -726,12 +746,14 @@ static void repl_handle_rdprotect(struct vm_area_struct *vma, pgd_t *pgd,
 				  unsigned long addr, pte_t *ptep)
 {
 	pte_t pte = ptep_get(ptep);
+	u64 start = ktime_get_ns();
 
 	WARN_ON_ONCE(!repl_refresh_page(vma, pgd, addr, pte));
 	set_pte_at(vma->vm_mm, addr, ptep,
 		   pte_wrprotect(repl_pte_rdunprotect(pte, vma)));
 	update_mmu_cache(vma, addr, ptep);
 	trace_repl_refresh(numa_node_id(), addr, pte_pfn(pte));
+	repl_cost_add(vma->vm_mm, start);
 }
 
 /* replicas of another page than @pfn go stale; ptes sharing it stay valid */
@@ -739,6 +761,7 @@ static void repl_invalidate(struct vm_area_struct *vma, pgd_t *pgd,
 			    unsigned long addr, unsigned long pfn)
 {
 	struct mm_struct *mm = vma->vm_mm;
+	u64 start = ktime_get_ns();
 	bool flush = false;
 	pgd_t *repl_pgd;
 	pte_t *other, pte;
@@ -762,6 +785,7 @@ static void repl_invalidate(struct vm_area_struct *vma, pgd_t *pgd,
 	}
 	if (flush)
 		flush_tlb_page(vma, addr);
+	repl_cost_add(mm, start);
 }
 
 /* main takes the last write from an up-to-date replica */
@@ -828,28 +852,14 @@ static void repl_handle_write(struct vm_area_struct *vma, pgd_t *pgd,
 		update_mmu_cache(vma, addr, ptep);
 }
 
-/* another node wrote this page before: its pte kept the dirty bit */
-static bool repl_cross_written(struct vm_area_struct *vma, pgd_t *pgd,
-			       unsigned long addr)
+/* another node wrote since this pte's copy was made, while shared */
+static bool repl_write_costly(struct mm_struct *mm, pte_t pte)
 {
-	struct mm_struct *mm = vma->vm_mm;
-	pgd_t *repl_pgd;
-	pte_t pte;
-	int nid;
-
-	if (!READ_ONCE(repl_write_unreplication))
-		return false;
-	for_each_repl_pgd(mm, nid, repl_pgd) {
-		if (repl_pgd == pgd)
-			continue;
-		pte = repl_pte_read(mm, repl_pgd, addr);
-		if (pte_present(pte) && pte_dirty(pte))
-			return true;
-	}
-	return false;
+	return READ_ONCE(mm->repl->state) == REPL_SHARED &&
+	       repl_pte_rdprotected(pte);
 }
 
-/* written from several nodes: copies become sharers, all writable */
+/* written while copied on other nodes: copies become sharers, all writable */
 static void repl_unreplicate(struct vm_area_struct *vma, unsigned long addr,
 			     pte_t *mainp)
 {
@@ -935,24 +945,39 @@ bool repl_zap_replicas(struct mmu_gather *tlb, struct vm_area_struct *vma,
 	return full;
 }
 
-/* a write through a sharer dirtied main's page: its folio has to know */
-static void repl_fold_dirty(struct vm_area_struct *vma, unsigned long addr,
-			    pte_t main)
+/* sharers go unflushed: main's unmap flushes the mm */
+static void repl_migrate_unshare(struct vm_area_struct *vma, unsigned long addr,
+				 pte_t main)
 {
 	struct mm_struct *mm = vma->vm_mm;
+	bool flush = false;
 	pgd_t *repl_pgd;
-	pte_t pte;
+	pte_t *ptep, pte;
 	int nid;
 
 	for_each_repl_pgd(mm, nid, repl_pgd) {
-		pte = repl_pte_read(mm, repl_pgd, addr);
-		if (pte_present(pte) && pte_pfn(pte) == pte_pfn(main) &&
-		    pte_dirty(pte)) {
-			folio_mark_dirty(
-				page_folio(vm_normal_page(vma, addr, main)));
-			return;
+		if (repl_pgd == mm->pgd)
+			continue;
+		ptep = repl_pte_map(mm, repl_pgd, addr);
+		if (!ptep)
+			continue;
+		pte = ptep_get(ptep);
+		if (pte_present(pte) && pte_pfn(pte) == pte_pfn(main)) {
+			/* sharer: its dirty bit goes to the folio */
+			pte = ptep_get_and_clear(mm, addr, ptep);
+			if (pte_dirty(pte))
+				folio_mark_dirty(page_folio(
+					vm_normal_page(vma, addr, main)));
+			trace_repl_unshare(nid, addr, pte_pfn(main));
+		} else if (pte_write(pte)) {
+			trace_repl_wrprotect(nid, addr, pte_pfn(pte));
+			ptep_set_wrprotect(mm, addr, ptep);
+			flush = true;
 		}
+		pte_unmap(ptep);
 	}
+	if (flush)
+		flush_tlb_page(vma, addr);
 }
 
 void repl_migrate_start(struct vm_area_struct *vma, unsigned long addr,
@@ -961,8 +986,7 @@ void repl_migrate_start(struct vm_area_struct *vma, unsigned long addr,
 	trace_repl_migrate_start(vma->vm_mm->repl->main_nid, addr,
 				 pte_pfn(ptep_get(mainp)));
 	repl_sync_main(vma, addr, mainp);
-	repl_wrprotect_all(vma, addr);
-	repl_fold_dirty(vma, addr, ptep_get(mainp));
+	repl_migrate_unshare(vma, addr, ptep_get(mainp));
 }
 
 /* main lives on its new page: its sharers follow it, the replica on its node is redundant */
@@ -1118,6 +1142,9 @@ static struct folio *repl_move_alloc(struct folio *src, unsigned long nid)
 	gfp_t gfp = (GFP_HIGHUSER_MOVABLE & ~__GFP_RECLAIM) | __GFP_THISNODE |
 		    __GFP_NOWARN | __GFP_NOMEMALLOC;
 
+	/* spread: the node interleave gives this file offset */
+	if (nid == NUMA_NO_NODE)
+		nid = repl_nth_node(src->index >> folio_order(src));
 	return __folio_alloc_node(gfp, folio_order(src), nid);
 }
 
@@ -1264,13 +1291,14 @@ static vm_fault_t repl_handle_pte_fault(struct vm_area_struct *vma, pgd_t *pgd,
 					unsigned long addr, unsigned int flags,
 					struct folio **prealloc_folio)
 {
-	bool write = flags & FAULT_FLAG_WRITE;
+	bool write = flags & FAULT_FLAG_WRITE, held;
 	struct mm_struct *mm = vma->vm_mm;
 	struct folio *wp_folio = NULL;
 	pte_t *mainp, *ptep, main;
 	struct page *page;
 	spinlock_t *ptl;
 	vm_fault_t ret = 0;
+	u64 start;
 
 	mainp = repl_pte_map_lock(mm, mm->pgd, addr, &ptl);
 	if (!mainp)
@@ -1282,11 +1310,14 @@ static vm_fault_t repl_handle_pte_fault(struct vm_area_struct *vma, pgd_t *pgd,
 	page = vm_normal_page(vma, addr, main);
 	if (write && (vma->vm_flags & VM_SHARED) && page) {
 		wp_folio = page_folio(page);
-		if (!repl_folio_lock_dirty(wp_folio)) {
+		if (!repl_folio_lock_dirty(wp_folio, &held)) {
+			start = ktime_get_ns();
 			folio_get(wp_folio);
 			pte_unmap_unlock(mainp, ptl);
 			ret = repl_page_mkwrite(vma, addr, flags, page);
 			folio_put(wp_folio);
+			if (held)
+				repl_cost_add(mm, start);
 			return ret;
 		}
 	}
@@ -1297,8 +1328,9 @@ static vm_fault_t repl_handle_pte_fault(struct vm_area_struct *vma, pgd_t *pgd,
 		goto unlock; /* freed meanwhile: refault */
 
 	if (pte_none(ptep_get(ptep)))
-		repl_install_replica(vma, addr, mainp, ptep, prealloc_folio);
-	if (write && repl_cross_written(vma, pgd, addr))
+		repl_install_replica(vma, addr, mainp, ptep, write,
+				     prealloc_folio);
+	if (repl_write_costly(mm, ptep_get(ptep)))
 		repl_unreplicate(vma, addr, mainp);
 	if (repl_pte_rdprotected(ptep_get(ptep)))
 		repl_handle_rdprotect(vma, pgd, addr, ptep);
@@ -1358,6 +1390,306 @@ vm_fault_t repl_handle_mm_fault(struct vm_area_struct *vma, unsigned long addr,
 	if (prealloc_folio)
 		folio_put(prealloc_folio);
 	return ret;
+}
+
+static void repl_walk_window(struct mm_struct *mm, unsigned long start,
+			     const struct mm_walk_ops *ops, void *private)
+{
+	mmap_read_lock(mm);
+	walk_page_range(mm, start, mm->repl->window + PGDIR_SIZE, ops, private);
+	mmap_read_unlock(mm);
+}
+
+/* every node out of pressure, and the memcg can take the full footprint back */
+static bool repl_restore_room(struct mm_struct *mm)
+{
+	long need = max_t(long, mm->repl->size - get_mm_rss(mm), 0);
+	int nid;
+
+	for_each_online_node(nid)
+		if (!repl_node_has_room(nid))
+			return false;
+	return repl_memcg_has_room(mm, need);
+}
+
+/* main off its node is isolated: interleave's while shared, home otherwise */
+static int repl_isolate_main(pte_t *mainp, unsigned long addr,
+			     unsigned long next, struct mm_walk *walk)
+{
+	pte_t main = ptep_get(mainp);
+	struct folio *folio = NULL;
+	int nid = walk->mm->repl->main_nid;
+
+	if (pte_present(main))
+		folio = vm_normal_folio(walk->vma, addr, main);
+	if (!folio)
+		return 0;
+	if (READ_ONCE(walk->mm->repl->state) != REPL_REPLICATED)
+		nid = repl_interleave_nid(walk->vma, addr, folio_order(folio));
+	if (folio_nid(folio) != nid)
+		repl_isolate(folio, walk->private);
+	return 0;
+}
+
+static const struct mm_walk_ops repl_main_ops = {
+	.pte_entry = repl_isolate_main,
+	.walk_lock = PGWALK_RDLOCK,
+};
+
+/* every main to its node: interleave's while shared, home otherwise */
+static bool repl_move_mains(struct mm_struct *mm)
+{
+	bool spread = READ_ONCE(mm->repl->state) != REPL_REPLICATED;
+	int placement = READ_ONCE(repl_main_placement);
+	LIST_HEAD(list);
+
+	if (!spread && placement != REPL_MAIN_BOUND &&
+	    placement != REPL_MAIN_DYNAMIC)
+		return true; /* no home: mains stay where the placement put them */
+
+	lru_add_drain_all(); /* recent folios onto the LRU, to be isolated */
+	repl_walk_window(mm, mm->repl->window, &repl_main_ops, &list);
+	if (!migrate_pages(&list, repl_move_alloc, NULL,
+			   spread ? NUMA_NO_NODE : mm->repl->main_nid,
+			   MIGRATE_SYNC, MR_NUMA_MISPLACED, NULL))
+		return true;
+	putback_movable_pages(&list);
+	return false;
+}
+
+/* remote sharers of main go: the next read on their node copies */
+static void repl_unshare_page(struct vm_area_struct *vma, unsigned long addr,
+			      unsigned long pfn)
+{
+	struct mm_struct *mm = vma->vm_mm;
+	pgd_t *repl_pgd;
+	pte_t *ptep, pte;
+	int nid;
+
+	for_each_repl_pgd(mm, nid, repl_pgd) {
+		if (repl_pgd == mm->pgd || nid == pfn_to_nid(pfn))
+			continue;
+		ptep = repl_pte_map(mm, repl_pgd, addr);
+		if (!ptep)
+			continue;
+		pte = ptep_get(ptep);
+		if (pte_present(pte) && pte_pfn(pte) == pfn) {
+			trace_repl_unshare(nid, addr, pfn);
+			if (pte_dirty(ptep_get_and_clear(mm, addr, ptep)))
+				folio_mark_dirty(pfn_folio(pfn));
+		}
+		pte_unmap(ptep);
+	}
+}
+
+static int repl_unshare_pte(pte_t *mainp, unsigned long addr,
+			    unsigned long next, struct mm_walk *walk)
+{
+	pte_t main = ptep_get(mainp);
+
+	if (pte_present(main) && vm_normal_page(walk->vma, addr, main))
+		repl_unshare_page(walk->vma, addr, pte_pfn(main));
+	return 0;
+}
+
+static const struct mm_walk_ops repl_unshare_ops = {
+	.pte_entry = repl_unshare_pte,
+	.walk_lock = PGWALK_RDLOCK,
+};
+
+/* every remote sharer goes, one flush for all */
+static void repl_unshare_all(struct mm_struct *mm)
+{
+	repl_walk_window(mm, mm->repl->window, &repl_unshare_ops, NULL);
+	flush_tlb_mm(mm);
+}
+
+/* main back home first, then the sharers that would read it remotely go */
+static void repl_restore(struct mm_struct *mm)
+{
+	unsigned long w = mm->repl->window;
+
+	if (!w)
+		return;
+	trace_repl_restore(mm->repl->main_nid, mm->repl->size, get_mm_rss(mm));
+	/* cleared first: a fault degrading again meanwhile sets it back */
+	WRITE_ONCE(mm->repl->degraded, false);
+
+	/* main's node is full: the rest when it has room */
+	if (!repl_move_mains(mm))
+		WRITE_ONCE(mm->repl->degraded, true);
+
+	repl_unshare_all(mm);
+	/* a partial restore keeps the footprint for the next one */
+	if (!READ_ONCE(mm->repl->degraded))
+		WRITE_ONCE(mm->repl->size, 0);
+}
+
+/* coherence time since the last tick, in percent of the cpu time */
+static unsigned int repl_cost(struct mm_struct *mm, struct task_struct *p)
+{
+	u64 cost_ns = atomic64_xchg(&mm->repl->cost_ns, 0), cpu_ns;
+	struct task_cputime ct;
+	unsigned int cost;
+
+	thread_group_cputime(p, &ct);
+	cpu_ns = ct.sum_exec_runtime - mm->repl->cpu_ns;
+	mm->repl->cpu_ns = ct.sum_exec_runtime;
+	cost = cpu_ns ? min_t(u64, div64_u64(cost_ns * 100, cpu_ns), 100) : 0;
+	return cost;
+}
+
+/* a new state counts its seconds from 0 */
+static void repl_enter(struct mm_repl *r, enum repl_state state)
+{
+	WRITE_ONCE(r->state, state);
+	r->ticks = 0;
+}
+
+/* reads 2x faster can afford to lose half the time to coherence */
+static unsigned int repl_cost_threshold(void)
+{
+	unsigned int s = READ_ONCE(repl_read_speedup);
+
+	return s > 100 ? 100 - 10000 / s : 0;
+}
+
+/*
+ * Replicated: over budget SHARE_TICKS in a row -> shared, mains spread.
+ * Shared: after write_retry_interval -> trial, copies back, mains still spread.
+ * Trial: over budget once -> shared; HOME_TICKS under -> replicated, mains home.
+ */
+static void repl_balance(struct mm_struct *mm, unsigned int cost)
+{
+	unsigned int retry = READ_ONCE(repl_write_retry_interval);
+	unsigned int max = repl_cost_threshold();
+	unsigned int nodes = num_online_nodes();
+	struct mm_repl *r = mm->repl;
+
+	if (!(READ_ONCE(repl_write_unreplication) && r->window)) {
+		/* policy off: back to replicated, mains home, then copies */
+		if (r->state != REPL_REPLICATED) {
+			repl_enter(r, REPL_REPLICATED);
+			if (r->window) {
+				repl_move_mains(mm);
+				repl_unshare_all(mm);
+			}
+		}
+		return;
+	}
+
+	r->ticks++;
+	switch (r->state) {
+	case REPL_REPLICATED:
+		if (cost <= max) {
+			r->ticks = 0;
+		} else if (r->ticks == REPL_SHARE_TICKS) {
+			repl_enter(r, REPL_SHARED);
+			repl_move_mains(mm);
+		}
+		break;
+	case REPL_SHARED:
+		if (retry && r->ticks >= retry) {
+			repl_enter(r, REPL_TRIAL);
+			repl_unshare_all(mm);
+		}
+		break;
+	case REPL_TRIAL:
+		/* mains home: n/(n-1) as many copies */
+		if (cost * nodes / (nodes - 1) > max) {
+			repl_enter(r, REPL_SHARED);
+		} else if (r->ticks >= REPL_HOME_TICKS) {
+			repl_enter(r, REPL_REPLICATED);
+			repl_move_mains(mm);
+		}
+		break;
+	}
+}
+
+/* an interval of 0 turns its pass off */
+static bool repl_due(unsigned long tick, unsigned int interval)
+{
+	return interval && !(tick % interval);
+}
+
+/* the first process krepld has work for, its task and mm held */
+static struct mm_struct *repl_next_mm(struct task_struct **taskp)
+{
+	struct mm_struct *mm = NULL;
+	struct task_struct *p;
+
+	rcu_read_lock();
+	for_each_process(p) {
+		task_lock(p);
+		mm = p->mm;
+		if (mm && repl_has_pgds(mm) &&
+		    (READ_ONCE(mm->repl->degraded) ||
+		     READ_ONCE(mm->repl->state) != REPL_REPLICATED ||
+		     (READ_ONCE(repl_write_unreplication) && mm->repl->window)))
+			mmget(mm);
+		else
+			mm = NULL;
+		task_unlock(p);
+		if (mm) {
+			*taskp = get_task_struct(p);
+			break;
+		}
+	}
+	rcu_read_unlock();
+	return mm;
+}
+
+static int repl_restored(void *unused)
+{
+	unsigned long tick = 0;
+	struct task_struct *p;
+	struct mm_struct *mm;
+	unsigned int cost;
+
+	while (!kthread_should_stop()) {
+		schedule_timeout_idle(HZ);
+		tick++;
+		mm = repl_next_mm(&p);
+		if (!mm)
+			continue;
+		cost = repl_cost(mm, p);
+		put_task_struct(p);
+		repl_balance(mm, cost);
+		trace_repl_cost(cost, READ_ONCE(mm->repl->state));
+		/* shared and trial spread mains on purpose */
+		if (repl_due(tick, READ_ONCE(repl_restore_interval)) &&
+		    READ_ONCE(mm->repl->degraded) &&
+		    READ_ONCE(mm->repl->state) == REPL_REPLICATED &&
+		    repl_restore_room(mm))
+			repl_restore(mm);
+		mmput(mm);
+	}
+	return 0;
+}
+
+static ssize_t restore_store(struct kobject *kobj, struct kobj_attribute *attr,
+			     const char *buf, size_t count)
+{
+	struct task_struct *task;
+	struct mm_struct *mm;
+	pid_t pid;
+	int ret = kstrtoint(buf, 10, &pid);
+
+	if (ret)
+		return ret;
+	task = find_get_task_by_vpid(pid);
+	if (!task)
+		return -ESRCH;
+	mm = get_task_mm(task);
+	put_task_struct(task);
+	if (!mm)
+		return -ESRCH;
+	if (repl_has_pgds(mm))
+		repl_restore(mm);
+	else
+		ret = -EINVAL;
+	mmput(mm);
+	return ret ?: count;
 }
 
 /* one pass per pmd: each node's pte table is mapped once, read in order */
@@ -1429,6 +1761,7 @@ static void repl_stat_print(struct seq_file *m, struct mm_struct *mm,
 	char copies[16];
 	pgd_t *pgd;
 
+	seq_printf(m, "state: %s\n", states[READ_ONCE(mm->repl->state)]);
 	seq_puts(m, "main folios:");
 	for (i = 0; i < NR_PAGE_ORDERS; i++) {
 		if (!st->orders[i])
@@ -1475,162 +1808,6 @@ void repl_stat_show(struct seq_file *m, struct mm_struct *mm)
 	kfree(st);
 }
 
-/* every node out of pressure, and the memcg can take the full footprint back */
-static bool repl_restore_room(struct mm_struct *mm)
-{
-	long need = max_t(long, mm->repl->size - get_mm_rss(mm), 0);
-	int nid;
-
-	for_each_online_node(nid)
-		if (!repl_node_has_room(nid))
-			return false;
-	return repl_memcg_has_room(mm, need);
-}
-
-/* main away from its home node is isolated to move back */
-static int repl_restore_main(pte_t *mainp, unsigned long addr,
-			     unsigned long next, struct mm_walk *walk)
-{
-	pte_t main = ptep_get(mainp);
-	struct folio *folio = NULL;
-
-	if (pte_present(main))
-		folio = vm_normal_folio(walk->vma, addr, main);
-	if (folio && folio_nid(folio) != walk->mm->repl->main_nid)
-		repl_isolate(folio, walk->private);
-	return 0;
-}
-
-/* sharers of main from another node go: the next fault there copies */
-static int repl_restore_sharers(pte_t *mainp, unsigned long addr,
-				unsigned long next, struct mm_walk *walk)
-{
-	struct vm_area_struct *vma = walk->vma;
-	struct mm_struct *mm = walk->mm;
-	pte_t main = ptep_get(mainp);
-	struct folio *folio = NULL;
-	pgd_t *repl_pgd;
-	int nid;
-
-	if (pte_present(main))
-		folio = vm_normal_folio(vma, addr, main);
-	if (!folio)
-		return 0;
-	repl_sync_main(vma, addr, mainp);
-	for_each_repl_pgd(mm, nid, repl_pgd) {
-		if (repl_pgd == mm->pgd || nid == folio_nid(folio))
-			continue;
-		if (pte_pfn(repl_pte_read(mm, repl_pgd, addr)) == pte_pfn(main))
-			repl_drop(vma, nid, addr, pte_pfn(main));
-	}
-	return 0;
-}
-
-static const struct mm_walk_ops repl_restore_main_ops = {
-	.pte_entry = repl_restore_main,
-	.walk_lock = PGWALK_RDLOCK,
-};
-
-static const struct mm_walk_ops repl_restore_sharers_ops = {
-	.pte_entry = repl_restore_sharers,
-	.walk_lock = PGWALK_RDLOCK,
-};
-
-/* main back home first, then the sharers that would read it remotely go */
-static void repl_restore(struct mm_struct *mm)
-{
-	unsigned long w = mm->repl->window;
-	LIST_HEAD(misplaced);
-
-	if (!w)
-		return;
-	trace_repl_restore(mm->repl->main_nid, mm->repl->size, get_mm_rss(mm));
-	/* cleared first: a fault degrading again meanwhile sets it back */
-	WRITE_ONCE(mm->repl->degraded, false);
-
-	if (READ_ONCE(repl_main_placement) == REPL_MAIN_BOUND ||
-	    READ_ONCE(repl_main_placement) == REPL_MAIN_DYNAMIC) {
-		lru_add_drain_all(); /* recent folios onto the LRU, to be isolated */
-		mmap_read_lock(mm);
-		walk_page_range(mm, w, w + PGDIR_SIZE, &repl_restore_main_ops,
-				&misplaced);
-		mmap_read_unlock(mm);
-		if (migrate_pages(&misplaced, repl_move_alloc, NULL,
-				  mm->repl->main_nid, MIGRATE_SYNC,
-				  MR_NUMA_MISPLACED, NULL)) {
-			putback_movable_pages(&misplaced);
-			/* main's node is full: the rest when it has room */
-			WRITE_ONCE(mm->repl->degraded, true);
-		}
-	}
-
-	mmap_read_lock(mm);
-	walk_page_range(mm, w, w + PGDIR_SIZE, &repl_restore_sharers_ops, NULL);
-	mmap_read_unlock(mm);
-	/* a partial restore keeps the footprint for the next one */
-	if (!READ_ONCE(mm->repl->degraded))
-		WRITE_ONCE(mm->repl->size, 0);
-}
-
-static int repl_restored(void *unused)
-{
-	struct task_struct *p;
-	struct mm_struct *mm;
-
-	while (!kthread_should_stop()) {
-		schedule_timeout_idle(
-			max(READ_ONCE(repl_restore_interval), 1U) * HZ);
-		if (!READ_ONCE(repl_restore_interval))
-			continue;
-		mm = NULL;
-		rcu_read_lock();
-		for_each_process(p) {
-			task_lock(p);
-			mm = p->mm;
-			if (mm && repl_has_pgds(mm) &&
-			    READ_ONCE(mm->repl->degraded))
-				mmget(mm);
-			else
-				mm = NULL;
-			task_unlock(p);
-			if (mm)
-				break;
-		}
-		rcu_read_unlock();
-		if (!mm)
-			continue;
-		if (repl_restore_room(mm))
-			repl_restore(mm);
-		mmput(mm);
-	}
-	return 0;
-}
-
-static ssize_t restore_store(struct kobject *kobj, struct kobj_attribute *attr,
-			     const char *buf, size_t count)
-{
-	struct task_struct *task;
-	struct mm_struct *mm;
-	pid_t pid;
-	int ret = kstrtoint(buf, 10, &pid);
-
-	if (ret)
-		return ret;
-	task = find_get_task_by_vpid(pid);
-	if (!task)
-		return -ESRCH;
-	mm = get_task_mm(task);
-	put_task_struct(task);
-	if (!mm)
-		return -ESRCH;
-	if (repl_has_pgds(mm))
-		repl_restore(mm);
-	else
-		ret = -EINVAL;
-	mmput(mm);
-	return ret ?: count;
-}
-
 static struct kobj_attribute restore_attr = __ATTR_WO(restore);
 
 static ssize_t main_placement_show(struct kobject *kobj,
@@ -1660,73 +1837,6 @@ static ssize_t main_placement_store(struct kobject *kobj,
 }
 
 static struct kobj_attribute main_placement_attr = __ATTR_RW(main_placement);
-
-static ssize_t free_percent_show(struct kobject *kobj,
-				 struct kobj_attribute *attr, char *buf)
-{
-	return sysfs_emit(buf, "%u\n", READ_ONCE(repl_free_percent));
-}
-
-static ssize_t free_percent_store(struct kobject *kobj,
-				  struct kobj_attribute *attr, const char *buf,
-				  size_t count)
-{
-	unsigned int v;
-	int ret = kstrtouint(buf, 10, &v);
-
-	if (ret)
-		return ret;
-	if (v > 100)
-		return -EINVAL;
-	WRITE_ONCE(repl_free_percent, v);
-	return count;
-}
-
-static struct kobj_attribute free_percent_attr = __ATTR_RW(free_percent);
-
-static ssize_t restore_interval_show(struct kobject *kobj,
-				     struct kobj_attribute *attr, char *buf)
-{
-	return sysfs_emit(buf, "%u\n", READ_ONCE(repl_restore_interval));
-}
-
-static ssize_t restore_interval_store(struct kobject *kobj,
-				      struct kobj_attribute *attr,
-				      const char *buf, size_t count)
-{
-	unsigned int v;
-	int ret = kstrtouint(buf, 10, &v);
-
-	if (ret)
-		return ret;
-	WRITE_ONCE(repl_restore_interval, v);
-	return count;
-}
-
-static struct kobj_attribute restore_interval_attr =
-	__ATTR_RW(restore_interval);
-
-static ssize_t write_unreplication_show(struct kobject *kobj,
-					struct kobj_attribute *attr, char *buf)
-{
-	return sysfs_emit(buf, "%d\n", READ_ONCE(repl_write_unreplication));
-}
-
-static ssize_t write_unreplication_store(struct kobject *kobj,
-					 struct kobj_attribute *attr,
-					 const char *buf, size_t count)
-{
-	bool v;
-	int ret = kstrtobool(buf, &v);
-
-	if (ret)
-		return ret;
-	WRITE_ONCE(repl_write_unreplication, v);
-	return count;
-}
-
-static struct kobj_attribute write_unreplication_attr =
-	__ATTR_RW(write_unreplication);
 
 static ssize_t files_show(struct kobject *kobj, struct kobj_attribute *attr,
 			  char *buf)
@@ -1767,6 +1877,33 @@ out:
 
 static struct kobj_attribute files_attr = __ATTR_RW(files);
 
+#define REPL_ATTR(name, max)                                               \
+	static ssize_t name##_show(struct kobject *kobj,                   \
+				   struct kobj_attribute *attr, char *buf) \
+	{                                                                  \
+		return sysfs_emit(buf, "%u\n", READ_ONCE(repl_##name));    \
+	}                                                                  \
+	static ssize_t name##_store(struct kobject *kobj,                  \
+				    struct kobj_attribute *attr,           \
+				    const char *buf, size_t count)         \
+	{                                                                  \
+		unsigned int v;                                            \
+		int ret = kstrtouint(buf, 10, &v);                         \
+		if (ret)                                                   \
+			return ret;                                        \
+		if (v > (max))                                             \
+			return -EINVAL;                                    \
+		WRITE_ONCE(repl_##name, v);                                \
+		return count;                                              \
+	}                                                                  \
+	static struct kobj_attribute name##_attr = __ATTR_RW(name)
+
+REPL_ATTR(free_percent, 100);
+REPL_ATTR(restore_interval, UINT_MAX);
+REPL_ATTR(write_unreplication, 1);
+REPL_ATTR(read_speedup, 10000);
+REPL_ATTR(write_retry_interval, UINT_MAX);
+
 static struct attribute *repl_attrs[] = {
 	&restore_attr.attr,
 	&main_placement_attr.attr,
@@ -1774,6 +1911,8 @@ static struct attribute *repl_attrs[] = {
 	&restore_interval_attr.attr,
 	&files_attr.attr,
 	&write_unreplication_attr.attr,
+	&read_speedup_attr.attr,
+	&write_retry_interval_attr.attr,
 	NULL,
 };
 static const struct attribute_group repl_attr_group = {

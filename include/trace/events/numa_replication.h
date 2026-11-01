@@ -120,6 +120,23 @@ TRACE_EVENT(repl_restore,
 	TP_printk("n%d size %lu rss %lu", __entry->node, __entry->size,
 		  __entry->rss)
 );
+
+TRACE_EVENT(repl_cost,
+	TP_PROTO(unsigned int cost, u8 state),
+	TP_ARGS(cost, state),
+	TP_STRUCT__entry(
+		__field(unsigned int, cost)
+		__field(u8, state)
+	),
+	TP_fast_assign(
+		__entry->cost = cost;
+		__entry->state = state;
+	),
+	TP_printk("cost %u%% %s", __entry->cost,
+		  __print_symbolic(__entry->state, { REPL_REPLICATED, "replicated" },
+				   { REPL_SHARED, "shared" }, { REPL_TRIAL, "trial" }))
+);
+
 /* clang-format on */
 
 #endif

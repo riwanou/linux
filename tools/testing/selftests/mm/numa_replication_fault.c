@@ -195,6 +195,22 @@ static void *reclaim_replicas(void *arg)
 	return (void *)1;
 }
 
+/* restore passes back to back: sharers dropped under the writers and krepld's probes */
+static void *rereplicator(void *arg)
+{
+	int unshared = event_open("repl_unshare");
+	unsigned long n;
+	long u;
+	char pid[16];
+
+	snprintf(pid, sizeof(pid), "%d", getpid());
+	for (n = 0; !__atomic_load_n(&stop, __ATOMIC_RELAXED); n++)
+		write_file(REPL_SYSFS "restore", pid);
+	u = event_count(unshared);
+	ksft_print_msg("%lu restore passes: %ld sharers dropped\n", n, u);
+	return (void *)(long)(u > 0);
+}
+
 static int stress(const struct backing *b, void *(*background)(void *))
 {
 	pthread_t th[MAX_THREADS], bg;
@@ -283,6 +299,48 @@ static int test_stress_dynamic(const struct backing *b, const char *name)
 	return ok;
 }
 
+/* budget 0: any coherence cost is over it; a trial every 5 s */
+static void unrepl_knobs(int on)
+{
+	write_file(REPL_SYSFS "write_unreplication", on ? "1" : "0");
+	write_file(REPL_SYSFS "read_speedup", on ? "100" : "200");
+	write_file(REPL_SYSFS "write_retry_interval", on ? "1" : "60");
+	if (!on)
+		sleep(2); /* krepld puts the process back to replicated */
+}
+
+/* @steps twice a second for @secs seconds: every krepld tick sees one */
+static int repeat(char *p, const char *steps, char *val, int secs)
+{
+	int n;
+
+	for (n = 0; n < secs * 2; n++) {
+		if (!run_steps(p, steps, val))
+			return 0;
+		usleep(500000);
+	}
+	return 1;
+}
+
+/* shared first: the stress's writes unreplicate while trials and restores race them */
+static int test_stress_unrepl(const struct backing *b, const char *name)
+{
+	char val = 0, *p;
+	int fd, ok, unreplicated;
+	long n;
+
+	unrepl_knobs(1);
+	p = map(b, sz, &fd);
+	ok = repeat(p, "w1 r*", &val, 5);
+	unreplicated = event_open("repl_unreplicate");
+	ok = ok && stress(b, rereplicator);
+	n = event_count(unreplicated);
+	unmap(p, sz, fd);
+	unrepl_knobs(0);
+	ksft_print_msg("%ld pages unreplicated\n", n);
+	return ok && n > 0;
+}
+
 /* node 0 holds main, node L touches first */
 static int want_node(const struct backing *b, const char *mode, char *page,
 		     unsigned long i)
@@ -337,34 +395,74 @@ static int test_dynamic_full(const struct backing *b, const char *name)
 	return ok;
 }
 
-/* a write after a read elsewhere shares the page; a first write does not */
-static int unrepl(const struct backing *b, const char *steps, long want)
+/* main's pages sit where @mode puts them */
+static int mains_at(const struct backing *b, char *p, const char *mode)
 {
-	const char *knob =
-		"/sys/kernel/mm/numa_replication/write_unreplication";
-	int unreplicated = event_open("repl_unreplicate");
-	char val = 0, *p;
-	int fd, ok;
-	long n;
+	unsigned long i, n = sz / PAGE;
+	void **pages = malloc(n * sizeof(*pages));
+	int *status = malloc(n * sizeof(*status));
+	int ok;
 
-	write_file(knob, "1");
-	p = map(b, sz, &fd);
-	ok = run_steps(p, steps, &val);
-	n = event_count(unreplicated);
-	unmap(p, sz, fd);
-	write_file(knob, "0");
-	ksft_print_msg("%ld pages unreplicated, want %ld\n", n, want);
-	return ok && n == want;
+	for (i = 0; i < n; i++)
+		pages[i] = p + i * PAGE;
+	/* no target nodes: move_pages only reports the node of main's pages */
+	ok = !syscall(SYS_move_pages, 0, n, pages, NULL, status, 0);
+	for (i = 0; ok && i < n; i++) {
+		if (status[i] == want_node(b, mode, pages[i], i))
+			continue;
+		ksft_print_msg("%s page %lu: node %d, want %d\n", mode, i,
+			       status[i], want_node(b, mode, pages[i], i));
+		ok = 0;
+	}
+	free(pages);
+	free(status);
+	return ok;
 }
 
+/* node 1 writes: shared, trials fail. Reads only: a trial passes, mains home */
 static int test_unrepl(const struct backing *b, const char *name)
 {
-	return unrepl(b, "r* w1 wL", sz / PAGE);
+	char val = 0, *p;
+	int fd, ok;
+
+	unrepl_knobs(1);
+	p = map(b, sz, &fd);
+	madvise(p, sz, MADV_RANDOM);
+	ok = repeat(p, "w1 r*", &val, 5) && mains_at(b, p, "interleave") &&
+	     repeat(p, "r*", &val, 11) && mains_at(b, p, "bound");
+	unmap(p, sz, fd);
+	unrepl_knobs(0);
+	return ok;
 }
 
-static int test_unrepl_one_writer(const struct backing *b, const char *name)
+/* the policy's state, first line of numa_repl_stat */
+static int state_is(const char *want)
 {
-	return unrepl(b, "r* w1 r* w1 r*", 0);
+	FILE *f = fopen("/proc/self/numa_repl_stat", "r");
+	char line[64] = "";
+
+	if (f) {
+		fgets(line, sizeof(line), f);
+		fclose(f);
+	}
+	if (strstr(line, want))
+		return 1;
+	ksft_print_msg("%s, want %s\n", strtok(line, "\n"), want);
+	return 0;
+}
+
+/* writes no other node reads cost nothing: stays replicated */
+static int test_unrepl_local(const struct backing *b, const char *name)
+{
+	char val = 0, *p;
+	int fd, ok;
+
+	unrepl_knobs(1);
+	p = map(b, sz, &fd);
+	ok = repeat(p, "r1 w1", &val, 6) && state_is("replicated");
+	unmap(p, sz, fd);
+	unrepl_knobs(0);
+	return ok;
 }
 
 int main(int argc, char **argv)
@@ -372,7 +470,7 @@ int main(int argc, char **argv)
 	unsigned int b, i;
 
 	repl_test_init(argc, argv);
-	ksft_set_plan(ARRAY_SIZE(backings) * (11 + ARRAY_SIZE(protocols)));
+	ksft_set_plan(ARRAY_SIZE(backings) * (12 + ARRAY_SIZE(protocols)));
 	for (b = 0; b < ARRAY_SIZE(backings); b++) {
 		for (i = 0; i < ARRAY_SIZE(protocols); i++)
 			run(test_protocol, &backings[b], protocols[i]);
@@ -382,12 +480,13 @@ int main(int argc, char **argv)
 		run(test_stress_reclaim_replicas, &backings[b],
 		    "stress: reclaim replicas");
 		run(test_stress_dynamic, &backings[b], "stress: dynamic");
+		run(test_stress_unrepl, &backings[b], "stress: unrepl");
 		run(test_dynamic_full, &backings[b], "dynamic: no room");
 		run(test_main_placement, &backings[b], "bound");
 		run(test_main_placement, &backings[b], "first_touch");
 		run(test_main_placement, &backings[b], "interleave");
 		run(test_unrepl, &backings[b], "unrepl");
-		run(test_unrepl_one_writer, &backings[b], "unrepl: one writer");
+		run(test_unrepl_local, &backings[b], "unrepl: local");
 	}
 	ksft_finished();
 }
