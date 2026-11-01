@@ -413,46 +413,59 @@ static void repl_copy(struct vm_area_struct *vma, unsigned long addr,
 	trace_repl_copy(addr, page_to_pfn(src), page_to_pfn(dst));
 }
 
-static bool repl_node_has_room(int nid)
+/* pages a node can take above repl_free_percent */
+static long repl_node_room(int nid)
 {
-	unsigned long free = sum_zone_node_page_state(nid, NR_FREE_PAGES);
+	long free = sum_zone_node_page_state(nid, NR_FREE_PAGES);
 
-	return free >
+	return free -
 	       node_present_pages(nid) * READ_ONCE(repl_free_percent) / 100;
 }
 
 #ifdef CONFIG_MEMCG
-static bool repl_memcg_has_room(struct mm_struct *mm, unsigned long extra)
+/* pages the memcg can take before its limit, less repl_free_percent */
+static long repl_memcg_room(struct mm_struct *mm)
 {
 	struct mem_cgroup *memcg = get_mem_cgroup_from_mm(mm);
 	unsigned long limit;
-	bool room = true;
+	long room = LONG_MAX;
 
 	if (!memcg)
-		return true;
+		return LONG_MAX;
 	if (mem_cgroup_is_root(memcg))
 		goto out;
 	limit = READ_ONCE(memcg->memory.high);
 	if (limit == PAGE_COUNTER_MAX)
 		limit = READ_ONCE(memcg->memory.max);
 	if (limit != PAGE_COUNTER_MAX)
-		room = page_counter_read(&memcg->memory) + extra +
-			       limit * READ_ONCE(repl_free_percent) / 100 <=
-		       limit;
+		room = (long)(limit -
+			      limit * READ_ONCE(repl_free_percent) / 100) -
+		       (long)page_counter_read(&memcg->memory);
 out:
 	mem_cgroup_put(memcg);
 	return room;
 }
 #else
-static bool repl_memcg_has_room(struct mm_struct *mm, unsigned long extra)
+static long repl_memcg_room(struct mm_struct *mm)
 {
-	return true;
+	return LONG_MAX;
 }
 #endif
 
 static bool repl_has_room(struct mm_struct *mm, int nid)
 {
-	return repl_node_has_room(nid) && repl_memcg_has_room(mm, 0);
+	return repl_node_room(nid) > 0 && repl_memcg_room(mm) > 0;
+}
+
+/* copies memory can take back: the nodes' room, capped by the memcg's */
+static long repl_room(struct mm_struct *mm)
+{
+	long room = 0;
+	int nid;
+
+	for_each_online_node(nid)
+		room += max(repl_node_room(nid), 0L);
+	return min(room, repl_memcg_room(mm));
 }
 
 static struct folio *repl_prealloc_folio(struct vm_area_struct *vma, int nid)
@@ -1400,18 +1413,6 @@ static void repl_walk_window(struct mm_struct *mm, unsigned long start,
 	mmap_read_unlock(mm);
 }
 
-/* every node out of pressure, and the memcg can take the full footprint back */
-static bool repl_restore_room(struct mm_struct *mm)
-{
-	long need = max_t(long, mm->repl->size - get_mm_rss(mm), 0);
-	int nid;
-
-	for_each_online_node(nid)
-		if (!repl_node_has_room(nid))
-			return false;
-	return repl_memcg_has_room(mm, need);
-}
-
 /* main off its node is isolated: interleave's while shared, home otherwise */
 static int repl_isolate_main(pte_t *mainp, unsigned long addr,
 			     unsigned long next, struct mm_walk *walk)
@@ -1458,12 +1459,13 @@ static bool repl_move_mains(struct mm_struct *mm)
 }
 
 /* remote sharers of main go: the next read on their node copies */
-static void repl_unshare_page(struct vm_area_struct *vma, unsigned long addr,
+static long repl_unshare_page(struct vm_area_struct *vma, unsigned long addr,
 			      unsigned long pfn)
 {
 	struct mm_struct *mm = vma->vm_mm;
 	pgd_t *repl_pgd;
 	pte_t *ptep, pte;
+	long dropped = 0;
 	int nid;
 
 	for_each_repl_pgd(mm, nid, repl_pgd) {
@@ -1477,19 +1479,23 @@ static void repl_unshare_page(struct vm_area_struct *vma, unsigned long addr,
 			trace_repl_unshare(nid, addr, pfn);
 			if (pte_dirty(ptep_get_and_clear(mm, addr, ptep)))
 				folio_mark_dirty(pfn_folio(pfn));
+			dropped++;
 		}
 		pte_unmap(ptep);
 	}
+
+	return dropped;
 }
 
 static int repl_unshare_pte(pte_t *mainp, unsigned long addr,
 			    unsigned long next, struct mm_walk *walk)
 {
+	long *budget = walk->private;
 	pte_t main = ptep_get(mainp);
 
 	if (pte_present(main) && vm_normal_page(walk->vma, addr, main))
-		repl_unshare_page(walk->vma, addr, pte_pfn(main));
-	return 0;
+		*budget -= repl_unshare_page(walk->vma, addr, pte_pfn(main));
+	return *budget <= 0;
 }
 
 static const struct mm_walk_ops repl_unshare_ops = {
@@ -1497,10 +1503,14 @@ static const struct mm_walk_ops repl_unshare_ops = {
 	.walk_lock = PGWALK_RDLOCK,
 };
 
-/* every remote sharer goes, one flush for all */
+/* sharers go, as many as memory can copy back, one flush for all */
 static void repl_unshare_all(struct mm_struct *mm)
 {
-	repl_walk_window(mm, mm->repl->window, &repl_unshare_ops, NULL);
+	long budget = repl_room(mm);
+
+	if (budget <= 0)
+		return;
+	repl_walk_window(mm, mm->repl->window, &repl_unshare_ops, &budget);
 	flush_tlb_mm(mm);
 }
 
@@ -1515,8 +1525,9 @@ static void repl_restore(struct mm_struct *mm)
 	/* cleared first: a fault degrading again meanwhile sets it back */
 	WRITE_ONCE(mm->repl->degraded, false);
 
-	/* main's node is full: the rest when it has room */
-	if (!repl_move_mains(mm))
+	/* mains home once every copy fits again, until then where reclaim put them */
+	if (repl_room(mm) < (long)(mm->repl->size - get_mm_rss(mm)) ||
+	    !repl_move_mains(mm))
 		WRITE_ONCE(mm->repl->degraded, true);
 
 	repl_unshare_all(mm);
@@ -1612,14 +1623,19 @@ static bool repl_due(unsigned long tick, unsigned int interval)
 	return interval && !(tick % interval);
 }
 
-/* the first process krepld has work for, its task and mm held */
-static struct mm_struct *repl_next_mm(struct task_struct **taskp)
+/* the next process from pid *nr krepld has work for, its task and mm held */
+static struct mm_struct *repl_next_mm(int *nr, struct task_struct **taskp)
 {
 	struct mm_struct *mm = NULL;
 	struct task_struct *p;
+	struct pid *pid;
 
 	rcu_read_lock();
-	for_each_process(p) {
+	while (!mm && (pid = find_ge_pid(*nr, &init_pid_ns))) {
+		*nr = pid_nr(pid) + 1;
+		p = pid_task(pid, PIDTYPE_TGID);
+		if (!p)
+			continue;
 		task_lock(p);
 		mm = p->mm;
 		if (mm && repl_has_pgds(mm) &&
@@ -1630,10 +1646,8 @@ static struct mm_struct *repl_next_mm(struct task_struct **taskp)
 		else
 			mm = NULL;
 		task_unlock(p);
-		if (mm) {
+		if (mm)
 			*taskp = get_task_struct(p);
-			break;
-		}
 	}
 	rcu_read_unlock();
 	return mm;
@@ -1644,26 +1658,26 @@ static int repl_restored(void *unused)
 	unsigned long tick = 0;
 	struct task_struct *p;
 	struct mm_struct *mm;
+	int nr;
 	unsigned int cost;
 
 	while (!kthread_should_stop()) {
 		schedule_timeout_idle(HZ);
 		tick++;
-		mm = repl_next_mm(&p);
-		if (!mm)
-			continue;
-		cost = repl_cost(mm, p);
-		put_task_struct(p);
-		repl_balance(mm, cost);
-		trace_repl_cost(cost, READ_ONCE(mm->repl->state));
-		/* shared and trial spread mains on purpose */
-		if (repl_due(tick, READ_ONCE(repl_restore_interval)) &&
-		    READ_ONCE(mm->repl->degraded) &&
-		    READ_ONCE(mm->repl->state) == REPL_REPLICATED &&
-		    repl_restore_room(mm))
-			repl_restore(mm);
-		mmput(mm);
+		/* every process each tick: one must not hide the others */
+		for (nr = 1; (mm = repl_next_mm(&nr, &p)); mmput(mm)) {
+			cost = repl_cost(mm, p);
+			put_task_struct(p);
+			repl_balance(mm, cost);
+			trace_repl_cost(cost, READ_ONCE(mm->repl->state));
+			if (repl_due(tick, READ_ONCE(repl_restore_interval)) &&
+			    READ_ONCE(mm->repl->degraded) &&
+			    READ_ONCE(mm->repl->state) == REPL_REPLICATED &&
+			    repl_room(mm) > 0)
+				repl_restore(mm);
+		}
 	}
+
 	return 0;
 }
 
