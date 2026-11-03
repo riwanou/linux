@@ -419,22 +419,6 @@ static int mains_at(const struct backing *b, char *p, const char *mode)
 	return ok;
 }
 
-/* node 1 writes: shared, trials fail. Reads only: a trial passes, mains home */
-static int test_unrepl(const struct backing *b, const char *name)
-{
-	char val = 0, *p;
-	int fd, ok;
-
-	unrepl_knobs(1);
-	p = map(b, sz, &fd);
-	madvise(p, sz, MADV_RANDOM);
-	ok = repeat(p, "w1 r*", &val, 5) && mains_at(b, p, "interleave") &&
-	     repeat(p, "r*", &val, 11) && mains_at(b, p, "bound");
-	unmap(p, sz, fd);
-	unrepl_knobs(0);
-	return ok;
-}
-
 /* the policy's state, first line of numa_repl_stat */
 static int state_is(const char *want)
 {
@@ -449,6 +433,51 @@ static int state_is(const char *want)
 		return 1;
 	ksft_print_msg("%s, want %s\n", strtok(line, "\n"), want);
 	return 0;
+}
+
+/* every node reads its own pages: nothing mapped remotely */
+static int all_local(void)
+{
+	FILE *f = fopen("/proc/self/numa_repl_stat", "r");
+	unsigned long w, r, s, dirty, young, local, remote;
+	char line[256], *p;
+	int nid, ok = 1;
+
+	if (!f)
+		return 0;
+	while (fgets(line, sizeof(line), f)) {
+		if (sscanf(line, "n%d", &nid) != 1)
+			continue;
+		/* columns start after the node name, and "(main)" on main's row */
+		p = strstr(line, "(main)");
+		p = p ? p + 6 : line + strcspn(line, " ");
+		if (sscanf(p, "%lu %lu %lu %lu %lu %lu %lu", &w, &r, &s, &dirty,
+			   &young, &local, &remote) == 7 &&
+		    remote) {
+			ksft_print_msg("n%d: %lu pages mapped remotely\n", nid,
+				       remote);
+			ok = 0;
+		}
+	}
+	fclose(f);
+	return ok;
+}
+
+/* node 1 writes: shared, trials fail. Reads only: a trial passes, mains home */
+static int test_unrepl(const struct backing *b, const char *name)
+{
+	char val = 0, *p;
+	int fd, ok;
+
+	unrepl_knobs(1);
+	p = map(b, sz, &fd);
+	madvise(p, sz, MADV_RANDOM);
+	ok = repeat(p, "w1 r*", &val, 5) && mains_at(b, p, "interleave") &&
+	     repeat(p, "r*", &val, 11) && mains_at(b, p, "bound") &&
+	     repeat(p, "r*", &val, 1) && all_local();
+	unmap(p, sz, fd);
+	unrepl_knobs(0);
+	return ok;
 }
 
 /* writes no other node reads cost nothing: stays replicated */
