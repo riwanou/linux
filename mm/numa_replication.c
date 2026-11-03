@@ -31,6 +31,12 @@ struct repl_stats {
 static struct mempolicy repl_preferred_policy[REPL_MAX_NODES];
 static struct mempolicy repl_bind_policy[REPL_MAX_NODES];
 
+/* mains to move, and how many pages more the budget allows */
+struct repl_mains {
+	struct list_head list;
+	long budget;
+};
+
 enum {
 	REPL_MAIN_BOUND,
 	REPL_MAIN_FIRST_TOUCH,
@@ -746,13 +752,14 @@ static struct folio *repl_release_replica(struct vm_area_struct *vma, int nid,
 }
 
 /* off the LRU onto @list, counted as isolated until it moves or goes back */
-static void repl_isolate(struct folio *folio, struct list_head *list)
+static bool repl_isolate(struct folio *folio, struct list_head *list)
 {
 	if (!folio_isolate_lru(folio))
-		return;
+		return false;
 	node_stat_mod_folio(folio, NR_ISOLATED_ANON + folio_is_file_lru(folio),
 			    folio_nr_pages(folio));
 	list_add_tail(&folio->lru, list);
+	return true;
 }
 
 static void repl_handle_rdprotect(struct vm_area_struct *vma, pgd_t *pgd,
@@ -1405,12 +1412,15 @@ vm_fault_t repl_handle_mm_fault(struct vm_area_struct *vma, unsigned long addr,
 	return ret;
 }
 
-static void repl_walk_window(struct mm_struct *mm, unsigned long start,
-			     const struct mm_walk_ops *ops, void *private)
+static int repl_walk_window(struct mm_struct *mm, unsigned long start,
+			    const struct mm_walk_ops *ops, void *private)
 {
+	int ret;
 	mmap_read_lock(mm);
-	walk_page_range(mm, start, mm->repl->window + PGDIR_SIZE, ops, private);
+	ret = walk_page_range(mm, start, mm->repl->window + PGDIR_SIZE, ops,
+			      private);
 	mmap_read_unlock(mm);
+	return ret;
 }
 
 /* main off its node is isolated: interleave's while shared, home otherwise */
@@ -1418,6 +1428,7 @@ static int repl_isolate_main(pte_t *mainp, unsigned long addr,
 			     unsigned long next, struct mm_walk *walk)
 {
 	pte_t main = ptep_get(mainp);
+	struct repl_mains *m = walk->private;
 	struct folio *folio = NULL;
 	int nid = walk->mm->repl->main_nid;
 
@@ -1427,9 +1438,9 @@ static int repl_isolate_main(pte_t *mainp, unsigned long addr,
 		return 0;
 	if (READ_ONCE(walk->mm->repl->state) != REPL_REPLICATED)
 		nid = repl_interleave_nid(walk->vma, addr, folio_order(folio));
-	if (folio_nid(folio) != nid)
-		repl_isolate(folio, walk->private);
-	return 0;
+	if (folio_nid(folio) != nid && repl_isolate(folio, &m->list))
+		m->budget -= folio_nr_pages(folio);
+	return m->budget <= 0;
 }
 
 static const struct mm_walk_ops repl_main_ops = {
@@ -1437,25 +1448,32 @@ static const struct mm_walk_ops repl_main_ops = {
 	.walk_lock = PGWALK_RDLOCK,
 };
 
-/* every main to its node: interleave's while shared, home otherwise */
-static bool repl_move_mains(struct mm_struct *mm)
+/* every main to its node, or as many as *budget allows: true once all are */
+static bool repl_move_mains(struct mm_struct *mm, long *budget)
 {
 	bool spread = READ_ONCE(mm->repl->state) != REPL_REPLICATED;
 	int placement = READ_ONCE(repl_main_placement);
-	LIST_HEAD(list);
+	unsigned int moved = 0;
+	struct repl_mains m = { .budget = budget ? *budget : LONG_MAX };
+	bool all;
 
 	if (!spread && placement != REPL_MAIN_BOUND &&
 	    placement != REPL_MAIN_DYNAMIC)
 		return true; /* no home: mains stay where the placement put them */
 
+	INIT_LIST_HEAD(&m.list);
 	lru_add_drain_all(); /* recent folios onto the LRU, to be isolated */
-	repl_walk_window(mm, mm->repl->window, &repl_main_ops, &list);
-	if (!migrate_pages(&list, repl_move_alloc, NULL,
-			   spread ? NUMA_NO_NODE : mm->repl->main_nid,
-			   MIGRATE_SYNC, MR_NUMA_MISPLACED, NULL))
-		return true;
-	putback_movable_pages(&list);
-	return false;
+	all = !repl_walk_window(mm, mm->repl->window, &repl_main_ops, &m);
+	if (migrate_pages(&m.list, repl_move_alloc, NULL,
+			  spread ? NUMA_NO_NODE : mm->repl->main_nid,
+			  MIGRATE_SYNC, MR_NUMA_MISPLACED, &moved)) {
+		putback_movable_pages(&m.list);
+		all = false;
+	}
+	/* only the mains that moved cost a copy: the rest stays for the sharers */
+	if (budget)
+		*budget -= moved;
+	return all;
 }
 
 /* remote sharers of main go: the next read on their node copies */
@@ -1504,20 +1522,25 @@ static const struct mm_walk_ops repl_unshare_ops = {
 };
 
 /* sharers go, as many as memory can copy back, one flush for all */
-static void repl_unshare_all(struct mm_struct *mm)
+static bool repl_unshare_all(struct mm_struct *mm, long budget)
 {
-	long budget = repl_room(mm);
+	bool all;
 
 	if (budget <= 0)
-		return;
-	repl_walk_window(mm, mm->repl->window, &repl_unshare_ops, &budget);
+		return false;
+	all = !repl_walk_window(mm, mm->repl->window, &repl_unshare_ops,
+				&budget);
 	flush_tlb_mm(mm);
+	return all;
 }
 
 /* main back home first, then the sharers that would read it remotely go */
 static void repl_restore(struct mm_struct *mm)
 {
 	unsigned long w = mm->repl->window;
+	long budget = repl_room(mm);
+	long share = budget / nodes_weight(mm->repl->nodes), left = share;
+	bool all;
 
 	if (!w)
 		return;
@@ -1525,12 +1548,13 @@ static void repl_restore(struct mm_struct *mm)
 	/* cleared first: a fault degrading again meanwhile sets it back */
 	WRITE_ONCE(mm->repl->degraded, false);
 
-	/* mains home once every copy fits again, until then where reclaim put them */
-	if (repl_room(mm) < (long)(mm->repl->size - get_mm_rss(mm)) ||
-	    !repl_move_mains(mm))
+	/* main's node gets its share of the room, like each other node */
+	all = repl_move_mains(mm, &left);
+	budget -= share - left;
+	/* restored once both are done, else the next pass goes on */
+	if (!repl_unshare_all(mm, budget) || !all)
 		WRITE_ONCE(mm->repl->degraded, true);
 
-	repl_unshare_all(mm);
 	/* a partial restore keeps the footprint for the next one */
 	if (!READ_ONCE(mm->repl->degraded))
 		WRITE_ONCE(mm->repl->size, 0);
@@ -1582,8 +1606,8 @@ static void repl_balance(struct mm_struct *mm, unsigned int cost)
 		if (r->state != REPL_REPLICATED) {
 			repl_enter(r, REPL_REPLICATED);
 			if (r->window) {
-				repl_move_mains(mm);
-				repl_unshare_all(mm);
+				repl_move_mains(mm, NULL);
+				repl_unshare_all(mm, repl_room(mm));
 			}
 		}
 		return;
@@ -1596,13 +1620,13 @@ static void repl_balance(struct mm_struct *mm, unsigned int cost)
 			r->ticks = 0;
 		} else if (r->ticks == REPL_SHARE_TICKS) {
 			repl_enter(r, REPL_SHARED);
-			repl_move_mains(mm);
+			repl_move_mains(mm, NULL);
 		}
 		break;
 	case REPL_SHARED:
 		if (retry && r->ticks >= retry) {
 			repl_enter(r, REPL_TRIAL);
-			repl_unshare_all(mm);
+			repl_unshare_all(mm, repl_room(mm));
 		}
 		break;
 	case REPL_TRIAL:
@@ -1611,7 +1635,7 @@ static void repl_balance(struct mm_struct *mm, unsigned int cost)
 			repl_enter(r, REPL_SHARED);
 		} else if (r->ticks >= REPL_HOME_TICKS) {
 			repl_enter(r, REPL_REPLICATED);
-			repl_move_mains(mm);
+			repl_move_mains(mm, NULL);
 		}
 		break;
 	}
