@@ -54,6 +54,7 @@ static bool repl_write_unreplication;
 /* percent: replicated reads vs interleaved */
 static unsigned int repl_read_speedup = 200;
 static unsigned int repl_write_retry_interval = 60;
+static unsigned int repl_write_budget = 1;
 /* seconds over budget in a row before sharing: one costly second is a burst */
 #define REPL_SHARE_TICKS 3
 /* seconds under budget on trial before mains go home: moving them is costly */
@@ -644,7 +645,8 @@ static void repl_install_replica(struct vm_area_struct *vma, unsigned long addr,
 	if (share || !folio || !main_page ||
 	    page_to_nid(main_page) == folio_nid(folio)) {
 		trace_repl_share(numa_node_id(), addr, pte_pfn(main));
-		if (main_page && page_to_nid(main_page) != numa_node_id())
+		if (!share && main_page &&
+		    page_to_nid(main_page) != numa_node_id())
 			repl_degrade(vma->vm_mm);
 		set_pte_at(vma->vm_mm, addr, ptep, main);
 		return;
@@ -872,11 +874,24 @@ static void repl_handle_write(struct vm_area_struct *vma, pgd_t *pgd,
 		update_mmu_cache(vma, addr, ptep);
 }
 
-/* another node wrote since this pte's copy was made, while shared */
+static bool repl_budget_spend(struct mm_struct *mm)
+{
+	struct mm_repl *r = mm->repl;
+
+	if (!(READ_ONCE(repl_write_unreplication) &&
+	      READ_ONCE(repl_write_budget)) ||
+	    atomic_long_read(&r->spent) >= READ_ONCE(r->budget))
+		return false;
+	atomic_long_inc(&r->spent);
+	return true;
+}
+
 static bool repl_write_costly(struct mm_struct *mm, pte_t pte)
 {
-	return READ_ONCE(mm->repl->state) == REPL_SHARED &&
-	       repl_pte_rdprotected(pte);
+	if (!repl_pte_rdprotected(pte))
+		return false;
+	return READ_ONCE(mm->repl->state) == REPL_SHARED ||
+	       repl_budget_spend(mm);
 }
 
 /* written while copied on other nodes: copies become sharers, all writable */
@@ -1534,6 +1549,22 @@ static bool repl_unshare_all(struct mm_struct *mm, long budget)
 	return all;
 }
 
+/* shared pages read 2x slower: their reads may cost what coherence does */
+static void repl_budget_grow(struct mm_repl *r, unsigned long pages,
+			     unsigned int cost)
+{
+	if (cost < 100)
+		WRITE_ONCE(r->budget,
+			   max(r->budget, pages * cost / (100 - cost)));
+}
+
+static void repl_retry(struct mm_struct *mm)
+{
+	repl_unshare_all(mm, repl_room(mm));
+	atomic_long_set(&mm->repl->spent, 0);
+	WRITE_ONCE(mm->repl->budget, 0);
+}
+
 /* main back home first, then the sharers that would read it remotely go */
 static void repl_restore(struct mm_struct *mm)
 {
@@ -1589,15 +1620,22 @@ static unsigned int repl_cost_threshold(void)
 	return s > 100 ? 100 - 10000 / s : 0;
 }
 
+/* an interval of 0 turns its pass off */
+static bool repl_due(unsigned long tick, unsigned int interval)
+{
+	return interval && !(tick % interval);
+}
+
 /*
- * Replicated: over budget SHARE_TICKS in a row -> shared, mains spread.
+ * Replicated: written pages share within the budget, all back every retry;
+ * over threshold SHARE_TICKS in a row -> shared, mains spread.
  * Shared: after write_retry_interval -> trial, copies back, mains still spread.
- * Trial: over budget once -> shared; HOME_TICKS under -> replicated, mains home.
+ * Trial: over threshold once -> shared; HOME_TICKS under -> replicated, mains home.
  */
 static void repl_balance(struct mm_struct *mm, unsigned int cost)
 {
 	unsigned int retry = READ_ONCE(repl_write_retry_interval);
-	unsigned int max = repl_cost_threshold();
+	unsigned int threshold = repl_cost_threshold();
 	unsigned int nodes = num_online_nodes();
 	struct mm_repl *r = mm->repl;
 
@@ -1614,9 +1652,14 @@ static void repl_balance(struct mm_struct *mm, unsigned int cost)
 	}
 
 	r->ticks++;
+	r->clock++;
+	repl_budget_grow(r, get_mm_rss(mm), cost);
+
 	switch (r->state) {
 	case REPL_REPLICATED:
-		if (cost <= max) {
+		if (repl_due(r->clock, retry))
+			repl_retry(mm);
+		if (cost <= threshold) {
 			r->ticks = 0;
 		} else if (r->ticks == REPL_SHARE_TICKS) {
 			repl_enter(r, REPL_SHARED);
@@ -1625,13 +1668,13 @@ static void repl_balance(struct mm_struct *mm, unsigned int cost)
 		break;
 	case REPL_SHARED:
 		if (retry && r->ticks >= retry) {
+			repl_retry(mm);
 			repl_enter(r, REPL_TRIAL);
-			repl_unshare_all(mm, repl_room(mm));
 		}
 		break;
 	case REPL_TRIAL:
 		/* mains home: n/(n-1) as many copies */
-		if (cost * nodes / (nodes - 1) > max) {
+		if (cost * nodes / (nodes - 1) > threshold) {
 			repl_enter(r, REPL_SHARED);
 		} else if (r->ticks >= REPL_HOME_TICKS) {
 			repl_enter(r, REPL_REPLICATED);
@@ -1639,12 +1682,6 @@ static void repl_balance(struct mm_struct *mm, unsigned int cost)
 		}
 		break;
 	}
-}
-
-/* an interval of 0 turns its pass off */
-static bool repl_due(unsigned long tick, unsigned int interval)
-{
-	return interval && !(tick % interval);
 }
 
 /* the next process from pid *nr krepld has work for, its task and mm held */
@@ -1941,17 +1978,14 @@ REPL_ATTR(restore_interval, UINT_MAX);
 REPL_ATTR(write_unreplication, 1);
 REPL_ATTR(read_speedup, 10000);
 REPL_ATTR(write_retry_interval, UINT_MAX);
+REPL_ATTR(write_budget, 1);
 
 static struct attribute *repl_attrs[] = {
-	&restore_attr.attr,
-	&main_placement_attr.attr,
-	&free_percent_attr.attr,
-	&restore_interval_attr.attr,
-	&files_attr.attr,
-	&write_unreplication_attr.attr,
-	&read_speedup_attr.attr,
-	&write_retry_interval_attr.attr,
-	NULL,
+	&restore_attr.attr,	 &main_placement_attr.attr,
+	&free_percent_attr.attr, &restore_interval_attr.attr,
+	&files_attr.attr,	 &write_unreplication_attr.attr,
+	&read_speedup_attr.attr, &write_retry_interval_attr.attr,
+	&write_budget_attr.attr, NULL,
 };
 static const struct attribute_group repl_attr_group = {
 	.name = "numa_replication",

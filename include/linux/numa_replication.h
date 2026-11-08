@@ -30,6 +30,9 @@ struct mm_repl {
 	u64 cpu_ns; /* cpu time at the last tick */
 	u8 state; /* replicated, shared or trial */
 	unsigned int ticks; /* seconds in this state */
+	unsigned int clock;
+	atomic_long_t spent;
+	unsigned long budget; /* pages that may stop being replicated */
 };
 
 #ifdef CONFIG_NUMA_REPL
