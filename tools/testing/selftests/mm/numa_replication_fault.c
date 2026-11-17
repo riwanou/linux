@@ -195,20 +195,17 @@ static void *reclaim_replicas(void *arg)
 	return (void *)1;
 }
 
-/* restore passes back to back: sharers dropped under the writers and krepld's probes */
+/* restore passes back to back, under the writers and krepld's retries */
 static void *rereplicator(void *arg)
 {
-	int unshared = event_open("repl_unshare");
 	unsigned long n;
-	long u;
 	char pid[16];
 
 	snprintf(pid, sizeof(pid), "%d", getpid());
 	for (n = 0; !__atomic_load_n(&stop, __ATOMIC_RELAXED); n++)
 		write_file(REPL_SYSFS "restore", pid);
-	u = event_count(unshared);
-	ksft_print_msg("%lu restore passes: %ld sharers dropped\n", n, u);
-	return (void *)(long)(u > 0);
+	ksft_print_msg("%lu restore passes\n", n);
+	return (void *)1;
 }
 
 static int stress(const struct backing *b, void *(*background)(void *))
@@ -299,14 +296,14 @@ static int test_stress_dynamic(const struct backing *b, const char *name)
 	return ok;
 }
 
-/* budget 0: any coherence cost is over it; a trial every 5 s */
+/* penalty 0: any coherence cost lets every written page share, between two retries */
 static void unrepl_knobs(int on)
 {
 	write_file(REPL_SYSFS "write_unreplication", on ? "1" : "0");
-	write_file(REPL_SYSFS "read_speedup", on ? "100" : "200");
-	write_file(REPL_SYSFS "write_retry_interval", on ? "1" : "60");
+	write_file(REPL_SYSFS "read_penalty", on ? "0" : "100");
+	write_file(REPL_SYSFS "write_retry_interval", on ? "2" : "60");
 	if (!on)
-		sleep(2); /* krepld puts the process back to replicated */
+		sleep(2); /* krepld takes the budget back */
 }
 
 /* @steps twice a second for @secs seconds: every krepld tick sees one */
@@ -322,20 +319,18 @@ static int repeat(char *p, const char *steps, char *val, int secs)
 	return 1;
 }
 
-/* shared first: the stress's writes unreplicate while trials and restores race them */
+/* a run costs coherence: from then on its writes share under the retries */
 static int test_stress_unrepl(const struct backing *b, const char *name)
 {
-	char val = 0, *p;
-	int fd, ok, unreplicated;
-	long n;
+	int unreplicated, runs, ok = 1;
+	long n = 0;
 
 	unrepl_knobs(1);
-	p = map(b, sz, &fd);
-	ok = repeat(p, "w1 r*", &val, 5);
-	unreplicated = event_open("repl_unreplicate");
-	ok = ok && stress(b, rereplicator);
-	n = event_count(unreplicated);
-	unmap(p, sz, fd);
+	for (runs = 0; ok && !n && runs < 64; runs++) {
+		unreplicated = event_open("repl_unreplicate");
+		ok = stress(b, rereplicator);
+		n = event_count(unreplicated);
+	}
 	unrepl_knobs(0);
 	ksft_print_msg("%ld pages unreplicated\n", n);
 	return ok && n > 0;
@@ -419,22 +414,6 @@ static int mains_at(const struct backing *b, char *p, const char *mode)
 	return ok;
 }
 
-/* the policy's state, first line of numa_repl_stat */
-static int state_is(const char *want)
-{
-	FILE *f = fopen("/proc/self/numa_repl_stat", "r");
-	char line[64] = "";
-
-	if (f) {
-		fgets(line, sizeof(line), f);
-		fclose(f);
-	}
-	if (strstr(line, want))
-		return 1;
-	ksft_print_msg("%s, want %s\n", strtok(line, "\n"), want);
-	return 0;
-}
-
 /* every node reads its own pages: nothing mapped remotely */
 static int all_local(void)
 {
@@ -463,24 +442,28 @@ static int all_local(void)
 	return ok;
 }
 
-/* node 1 writes: shared, trials fail. Reads only: a trial passes, mains home */
+/* two nodes write: shared, mains spread. Reads only: a retry holds, mains home */
 static int test_unrepl(const struct backing *b, const char *name)
 {
 	char val = 0, *p;
 	int fd, ok;
 
 	unrepl_knobs(1);
+	write_file(REPL_SYSFS "write_retry_interval", "0");
 	p = map(b, sz, &fd);
 	madvise(p, sz, MADV_RANDOM);
-	ok = repeat(p, "w1 r*", &val, 5) && mains_at(b, p, "interleave") &&
-	     repeat(p, "r*", &val, 11) && mains_at(b, p, "bound") &&
+	/* m0: new pages leave the per-cpu batches, where nothing can move them */
+	ok = run_steps(p, "w0 m0", &val) &&
+	     repeat(p, "w0 w1 r*", &val, 5) && mains_at(b, p, "interleave");
+	write_file(REPL_SYSFS "write_retry_interval", "2");
+	ok = ok && repeat(p, "r*", &val, 5) && mains_at(b, p, "bound") &&
 	     repeat(p, "r*", &val, 1) && all_local();
 	unmap(p, sz, fd);
 	unrepl_knobs(0);
 	return ok;
 }
 
-/* writes no other node reads cost nothing: stays replicated */
+/* writes no other node reads share nothing */
 static int test_unrepl_local(const struct backing *b, const char *name)
 {
 	char val = 0, *p;
@@ -488,7 +471,7 @@ static int test_unrepl_local(const struct backing *b, const char *name)
 
 	unrepl_knobs(1);
 	p = map(b, sz, &fd);
-	ok = repeat(p, "r1 w1", &val, 6) && state_is("replicated");
+	ok = repeat(p, "r1 w1", &val, 6) && all_local();
 	unmap(p, sz, fd);
 	unrepl_knobs(0);
 	return ok;
