@@ -49,16 +49,10 @@ static int repl_main_placement = REPL_MAIN_BOUND;
 static unsigned int repl_restore_interval = 1;
 static unsigned int repl_free_percent = 10;
 
-static const char *const states[] = { "replicated", "shared", "trial" };
 static bool repl_write_unreplication;
-/* percent: replicated reads vs interleaved */
-static unsigned int repl_read_speedup = 200;
+/* percent: how much longer a read takes once its page is shared */
+static unsigned int repl_read_penalty = 100;
 static unsigned int repl_write_retry_interval = 60;
-static unsigned int repl_write_budget = 1;
-/* seconds over budget in a row before sharing: one costly second is a burst */
-#define REPL_SHARE_TICKS 3
-/* seconds under budget on trial before mains go home: moving them is costly */
-#define REPL_HOME_TICKS 8
 
 static char repl_files[8][128];
 static DEFINE_MUTEX(repl_files_lock);
@@ -381,6 +375,28 @@ static pte_t *repl_pte_map(struct mm_struct *mm, pgd_t *pgd, unsigned long addr)
 	return pmd ? pte_offset_map(pmd, addr) : NULL;
 }
 
+/* @addr's pte in the next tree after @nid's, the last one unmapped */
+static pte_t *repl_pte_next(struct mm_struct *mm, unsigned long addr,
+			    pgd_t *skip, int *nid, pte_t *ptep)
+{
+	pgd_t *pgd;
+
+	if (ptep)
+		pte_unmap(ptep);
+	while ((*nid = next_node(*nid, mm->repl->nodes)) < MAX_NUMNODES) {
+		pgd = mm->repl->pgds[*nid];
+		ptep = pgd == skip ? NULL : repl_pte_map(mm, pgd, addr);
+		if (ptep)
+			return ptep;
+	}
+	return NULL;
+}
+
+/* @addr's pte in each tree but @skip, mapped for the body: no break out of it */
+#define for_each_repl_pte(mm, addr, skip, nid, ptep) \
+	for (nid = -1, ptep = NULL;                  \
+	     (ptep = repl_pte_next(mm, addr, skip, &nid, ptep));)
+
 static pte_t *repl_pte_map_lock(struct mm_struct *mm, pgd_t *pgd,
 				unsigned long addr, spinlock_t **ptl)
 {
@@ -475,16 +491,18 @@ static long repl_room(struct mm_struct *mm)
 	return min(room, repl_memcg_room(mm));
 }
 
+/* a copy is optional: from its node's free memory, or not at all */
+#define REPL_GFP \
+	((GFP_HIGHUSER_MOVABLE & ~__GFP_RECLAIM) | __GFP_THISNODE | __GFP_NOWARN)
+
 static struct folio *repl_prealloc_folio(struct vm_area_struct *vma, int nid)
 {
-	gfp_t gfp = (GFP_HIGHUSER_MOVABLE & ~__GFP_RECLAIM) | __GFP_THISNODE |
-		    __GFP_NOWARN;
 	struct folio *folio;
 
 	if (!repl_has_room(vma->vm_mm, nid))
 		return NULL;
-	folio = __folio_alloc_node(gfp, 0, nid);
-	if (folio && mem_cgroup_charge(folio, vma->vm_mm, gfp)) {
+	folio = __folio_alloc_node(REPL_GFP, 0, nid);
+	if (folio && mem_cgroup_charge(folio, vma->vm_mm, REPL_GFP)) {
 		folio_put(folio);
 		return NULL;
 	}
@@ -538,17 +556,7 @@ static int repl_main_nid(struct vm_area_struct *vma, unsigned long addr)
 			return repl_interleave_nid(vma, addr, 0);
 	}
 
-	if (READ_ONCE(mm->repl->state) != REPL_REPLICATED)
-		return repl_interleave_nid(vma, addr, 0);
-
 	return mm->repl->main_nid;
-}
-
-/* first loss under pressure: the footprint a restore rebuilds */
-static void repl_snapshot_size(struct mm_struct *mm)
-{
-	if (!READ_ONCE(mm->repl->size))
-		WRITE_ONCE(mm->repl->size, get_mm_rss(mm));
 }
 
 /* time spent keeping replicas coherent: what krepld weighs against the process */
@@ -557,11 +565,58 @@ static void repl_cost_add(struct mm_struct *mm, u64 start)
 	atomic64_add(ktime_get_ns() - start, &mm->repl->cost_ns);
 }
 
-/* replication lost locality under pressure: krepld restores it later */
+/* a copy on some node: every write pays to keep it coherent */
+static bool repl_page_replicated(struct mm_struct *mm, unsigned long addr,
+				 pte_t main)
+{
+	bool replicated = false;
+	pte_t *ptep, pte;
+	int nid;
+
+	for_each_repl_pte(mm, addr, mm->pgd, nid, ptep) {
+		pte = ptep_get(ptep);
+		replicated |= pte_present(pte) && pte_pfn(pte) != pte_pfn(main);
+	}
+	return replicated;
+}
+
+/* a node reads main from another node: the page is already counted in spent */
+static bool repl_page_shared(struct mm_struct *mm, unsigned long addr,
+			     pte_t main)
+{
+	int main_nid = pfn_to_nid(pte_pfn(main));
+	bool shared = false;
+	pte_t *ptep, pte;
+	int nid;
+
+	for_each_repl_pte(mm, addr, mm->pgd, nid, ptep) {
+		pte = ptep_get(ptep);
+		shared |= pte_present(pte) && pte_pfn(pte) == pte_pfn(main) &&
+			  nid != main_nid;
+	}
+	return shared;
+}
+
+/* a write that would copy or keep copies coherent shares main, within the budget */
+static bool repl_write_costly(struct mm_struct *mm, unsigned long addr,
+			      pte_t pte, pte_t main)
+{
+	struct mm_repl *r = mm->repl;
+
+	if (!(pte_none(pte) || repl_page_replicated(mm, addr, main)))
+		return false;
+	if (pte_none(pte) && repl_page_shared(mm, addr, main))
+		return true;
+	if (atomic_long_read(&r->spent) >= READ_ONCE(r->budget))
+		return false;
+	atomic_long_inc(&r->spent);
+	return true;
+}
+
+/* replication lost locality: krepld restores it later */
 static void repl_degrade(struct mm_struct *mm)
 {
 	WRITE_ONCE(mm->repl->degraded, true);
-	repl_snapshot_size(mm);
 }
 
 static vm_fault_t repl_install_main(struct vm_area_struct *vma,
@@ -574,36 +629,34 @@ static vm_fault_t repl_install_main(struct vm_area_struct *vma,
 	int nid = repl_main_nid(vma, addr);
 	unsigned short mode = repl_has_room(mm, nid) ? MPOL_BIND :
 						       MPOL_PREFERRED;
+	bool missing = pte_none(main);
 	struct mempolicy *old;
 	pmd_t dummy;
-	int ret = 0;
+	int ret;
 
 	vmf.pmd = pmd;
 	vmf.orig_pte = main;
-
-	if (pte_none(main)) {
-		if (vma_is_anonymous(vma))
-			vmf.flags |= FAULT_FLAG_WRITE; /* no zero page */
-		old = repl_push_alloc_node(nid, mode);
-		ret = do_pte_missing(&vmf);
-		repl_pop_alloc_node(old);
-		main = repl_pte_read(mm, mm->pgd, addr);
-		if (pte_present(main))
-			trace_repl_main_fill(mm->repl->main_nid, addr,
-					     pte_pfn(main));
-		return ret;
-	}
+	if (missing && vma_is_anonymous(vma))
+		vmf.flags |= FAULT_FLAG_WRITE; /* no zero page */
 	/* swap, migration: do_swap_page expects the pte mapped */
-	vmf.pte = pte_offset_map_rw_nolock(vma->vm_mm, pmd, addr, &dummy,
-					   &vmf.ptl);
-	if (!vmf.pte)
+	if (!missing)
+		vmf.pte = pte_offset_map_rw_nolock(mm, pmd, addr, &dummy,
+						   &vmf.ptl);
+	if (!missing && !vmf.pte)
 		return 0;
+
 	old = repl_push_alloc_node(nid, mode);
-	ret = do_swap_page(&vmf);
+	ret = missing ? do_pte_missing(&vmf) : do_swap_page(&vmf);
 	repl_pop_alloc_node(old);
+
 	main = repl_pte_read(mm, mm->pgd, addr);
-	if (pte_present(main))
+	if (pte_present(main) && missing)
+		trace_repl_main_fill(mm->repl->main_nid, addr, pte_pfn(main));
+	else if (pte_present(main))
 		trace_repl_main_swapin(mm->repl->main_nid, addr, pte_pfn(main));
+	/* a page cache page found off its home */
+	if (pte_present(main) && pfn_to_nid(pte_pfn(main)) != nid)
+		repl_degrade(mm);
 	return ret;
 }
 
@@ -611,42 +664,34 @@ static void repl_wrprotect_all(struct vm_area_struct *vma, unsigned long addr)
 {
 	struct mm_struct *mm = vma->vm_mm;
 	bool flush = false;
-	pgd_t *repl_pgd;
 	pte_t *ptep;
 	int nid;
 
-	for_each_repl_pgd(mm, nid, repl_pgd) {
-		ptep = repl_pte_map(mm, repl_pgd, addr);
-		if (!ptep)
+	for_each_repl_pte(mm, addr, NULL, nid, ptep) {
+		if (!pte_write(ptep_get(ptep)))
 			continue;
-		if (pte_write(ptep_get(ptep))) {
-			trace_repl_wrprotect(nid, addr,
-					     pte_pfn(ptep_get(ptep)));
-			ptep_set_wrprotect(mm, addr, ptep);
-			flush = true;
-		}
-		pte_unmap(ptep);
+		trace_repl_wrprotect(nid, addr, pte_pfn(ptep_get(ptep)));
+		ptep_set_wrprotect(mm, addr, ptep);
+		flush = true;
 	}
 	if (flush)
 		flush_tlb_page(vma, addr);
 }
 
 static void repl_install_replica(struct vm_area_struct *vma, unsigned long addr,
-				 pte_t *mainp, pte_t *ptep, bool write,
+				 pte_t *mainp, pte_t *ptep, bool share,
 				 struct folio **prealloc_folio)
 {
 	struct folio *folio = *prealloc_folio;
 	pte_t main = ptep_get(mainp), pte;
 	struct page *main_page = vm_normal_page(vma, addr, main);
-	bool share = READ_ONCE(vma->vm_mm->repl->state) == REPL_SHARED && write;
 
 	VM_WARN_ON_ONCE(ptep == mainp);
 
 	if (share || !folio || !main_page ||
 	    page_to_nid(main_page) == folio_nid(folio)) {
 		trace_repl_share(numa_node_id(), addr, pte_pfn(main));
-		if (!share && main_page &&
-		    page_to_nid(main_page) != numa_node_id())
+		if (main_page && page_to_nid(main_page) != numa_node_id())
 			repl_degrade(vma->vm_mm);
 		set_pte_at(vma->vm_mm, addr, ptep, main);
 		return;
@@ -768,46 +813,36 @@ static void repl_handle_rdprotect(struct vm_area_struct *vma, pgd_t *pgd,
 				  unsigned long addr, pte_t *ptep)
 {
 	pte_t pte = ptep_get(ptep);
-	u64 start = ktime_get_ns();
 
 	WARN_ON_ONCE(!repl_refresh_page(vma, pgd, addr, pte));
 	set_pte_at(vma->vm_mm, addr, ptep,
 		   pte_wrprotect(repl_pte_rdunprotect(pte, vma)));
 	update_mmu_cache(vma, addr, ptep);
 	trace_repl_refresh(numa_node_id(), addr, pte_pfn(pte));
-	repl_cost_add(vma->vm_mm, start);
 }
 
 /* replicas of another page than @pfn go stale; ptes sharing it stay valid */
-static void repl_invalidate(struct vm_area_struct *vma, pgd_t *pgd,
+static bool repl_invalidate(struct vm_area_struct *vma, pgd_t *pgd,
 			    unsigned long addr, unsigned long pfn)
 {
 	struct mm_struct *mm = vma->vm_mm;
-	u64 start = ktime_get_ns();
 	bool flush = false;
-	pgd_t *repl_pgd;
 	pte_t *other, pte;
 	int nid;
 
-	for_each_repl_pgd(mm, nid, repl_pgd) {
-		if (repl_pgd == pgd)
-			continue;
-		other = repl_pte_map(mm, repl_pgd, addr);
-		if (!other)
-			continue;
+	for_each_repl_pte(mm, addr, pgd, nid, other) {
 		pte = ptep_get(other);
-		if (repl_pte_uptodate(pte) && pte_pfn(pte) != pfn) {
-			trace_repl_invalidate(nid, addr, pte_pfn(pte));
-			pte = ptep_modify_prot_start(vma, addr, other);
-			ptep_modify_prot_commit(vma, addr, other, pte,
-						repl_pte_rdprotect(pte));
-			flush = true;
-		}
-		pte_unmap(other);
+		if (!(repl_pte_uptodate(pte) && pte_pfn(pte) != pfn))
+			continue;
+		trace_repl_invalidate(nid, addr, pte_pfn(pte));
+		pte = ptep_modify_prot_start(vma, addr, other);
+		ptep_modify_prot_commit(vma, addr, other, pte,
+					repl_pte_rdprotect(pte));
+		flush = true;
 	}
 	if (flush)
 		flush_tlb_page(vma, addr);
-	repl_cost_add(mm, start);
+	return flush;
 }
 
 /* main takes the last write from an up-to-date replica */
@@ -815,11 +850,14 @@ static void repl_sync_main(struct vm_area_struct *vma, unsigned long addr,
 			   pte_t *mainp)
 {
 	pte_t main = ptep_get(mainp);
+	u64 start;
 
 	if (!repl_pte_rdprotected(main))
 		return;
+	start = ktime_get_ns();
 	trace_repl_sync(vma->vm_mm->repl->main_nid, addr, pte_pfn(main));
 	repl_handle_rdprotect(vma, vma->vm_mm->pgd, addr, mainp);
+	repl_cost_add(vma->vm_mm, start);
 	folio_mark_dirty(page_folio(vm_normal_page(vma, addr, main)));
 }
 
@@ -856,13 +894,13 @@ static void repl_drop(struct vm_area_struct *vma, int nid, unsigned long addr,
 	pte_unmap(ptep);
 }
 
-static void repl_handle_write(struct vm_area_struct *vma, pgd_t *pgd,
+/* true if copies elsewhere went stale */
+static bool repl_handle_write(struct vm_area_struct *vma, pgd_t *pgd,
 			      unsigned long addr, pte_t *ptep)
 {
 	unsigned long pfn = pte_pfn(ptep_get(ptep));
+	bool invalidated = repl_invalidate(vma, pgd, addr, pfn);
 	pte_t pte;
-
-	repl_invalidate(vma, pgd, addr, pfn);
 
 	/* after invalidate: a stale TLB entry elsewhere could still write otherwise */
 	pte = ptep_get(ptep);
@@ -872,26 +910,7 @@ static void repl_handle_write(struct vm_area_struct *vma, pgd_t *pgd,
 	trace_repl_write(numa_node_id(), addr, pfn);
 	if (ptep_set_access_flags(vma, addr, ptep, pte, 1))
 		update_mmu_cache(vma, addr, ptep);
-}
-
-static bool repl_budget_spend(struct mm_struct *mm)
-{
-	struct mm_repl *r = mm->repl;
-
-	if (!(READ_ONCE(repl_write_unreplication) &&
-	      READ_ONCE(repl_write_budget)) ||
-	    atomic_long_read(&r->spent) >= READ_ONCE(r->budget))
-		return false;
-	atomic_long_inc(&r->spent);
-	return true;
-}
-
-static bool repl_write_costly(struct mm_struct *mm, pte_t pte)
-{
-	if (!repl_pte_rdprotected(pte))
-		return false;
-	return READ_ONCE(mm->repl->state) == REPL_SHARED ||
-	       repl_budget_spend(mm);
+	return invalidated;
 }
 
 /* written while copied on other nodes: copies become sharers, all writable */
@@ -900,7 +919,6 @@ static void repl_unreplicate(struct vm_area_struct *vma, unsigned long addr,
 {
 	struct mm_struct *mm = vma->vm_mm;
 	pte_t *ptep, pte, shared;
-	pgd_t *repl_pgd;
 	int nid;
 
 	trace_repl_unreplicate(mm->repl->main_nid, addr,
@@ -909,10 +927,7 @@ static void repl_unreplicate(struct vm_area_struct *vma, unsigned long addr,
 	repl_sync_main(vma, addr, mainp);
 	shared = pte_mkdirty(maybe_mkwrite(ptep_get(mainp), vma));
 
-	for_each_repl_pgd(mm, nid, repl_pgd) {
-		ptep = repl_pte_map(mm, repl_pgd, addr);
-		if (!ptep)
-			continue;
+	for_each_repl_pte(mm, addr, NULL, nid, ptep) {
 		pte = ptep_get(ptep);
 		if (pte_present(pte) && pte_pfn(pte) != pte_pfn(shared)) {
 			repl_drop_pte(vma, nid, addr, ptep, pte_pfn(shared));
@@ -921,8 +936,8 @@ static void repl_unreplicate(struct vm_area_struct *vma, unsigned long addr,
 			   ptep_set_access_flags(vma, addr, ptep, shared, 1)) {
 			update_mmu_cache(vma, addr, ptep);
 		}
-		pte_unmap(ptep);
 	}
+	repl_degrade(mm);
 }
 
 bool repl_zap_replicas(struct mmu_gather *tlb, struct vm_area_struct *vma,
@@ -933,11 +948,9 @@ bool repl_zap_replicas(struct mmu_gather *tlb, struct vm_area_struct *vma,
 	struct folio *folio;
 	bool full = false;
 	struct page *page;
-	pgd_t *repl_pgd;
 	unsigned long long main_pfn;
 	int nid;
 
-	main = ptep_get(mainp);
 	main = ptep_get(mainp);
 	if (!pte_present(main)) {
 		if (!softleaf_is_migration(softleaf_from_pte(main)))
@@ -951,17 +964,9 @@ bool repl_zap_replicas(struct mmu_gather *tlb, struct vm_area_struct *vma,
 	if (vma->vm_flags & VM_SHARED && pte_present(main))
 		repl_sync_main(vma, addr, mainp);
 
-	for_each_repl_pgd(mm, nid, repl_pgd) {
-		if (repl_pgd == mm->pgd)
-			continue;
-
-		ptep = repl_pte_map(mm, repl_pgd, addr);
-		if (!ptep)
-			continue;
-
+	for_each_repl_pte(mm, addr, mm->pgd, nid, ptep) {
 		pte = ptep_get_and_clear(mm, addr, ptep);
 		tlb_remove_tlb_entry(tlb, ptep, addr);
-		pte_unmap(ptep);
 
 		page = pte_present(pte) ? vm_normal_page(vma, addr, pte) : NULL;
 		if (!page || pte_pfn(pte) == main_pfn)
@@ -980,22 +985,16 @@ bool repl_zap_replicas(struct mmu_gather *tlb, struct vm_area_struct *vma,
 	return full;
 }
 
-/* sharers go unflushed: main's unmap flushes the mm */
+/* sharers wait for main's new page, unflushed: main's unmap flushes the mm */
 static void repl_migrate_unshare(struct vm_area_struct *vma, unsigned long addr,
 				 pte_t main)
 {
 	struct mm_struct *mm = vma->vm_mm;
 	bool flush = false;
-	pgd_t *repl_pgd;
 	pte_t *ptep, pte;
 	int nid;
 
-	for_each_repl_pgd(mm, nid, repl_pgd) {
-		if (repl_pgd == mm->pgd)
-			continue;
-		ptep = repl_pte_map(mm, repl_pgd, addr);
-		if (!ptep)
-			continue;
+	for_each_repl_pte(mm, addr, mm->pgd, nid, ptep) {
 		pte = ptep_get(ptep);
 		if (pte_present(pte) && pte_pfn(pte) == pte_pfn(main)) {
 			/* sharer: its dirty bit goes to the folio */
@@ -1003,13 +1002,12 @@ static void repl_migrate_unshare(struct vm_area_struct *vma, unsigned long addr,
 			if (pte_dirty(pte))
 				folio_mark_dirty(page_folio(
 					vm_normal_page(vma, addr, main)));
-			trace_repl_unshare(nid, addr, pte_pfn(main));
+			set_pte_at(mm, addr, ptep, repl_pte_rdprotect(pte));
 		} else if (pte_write(pte)) {
 			trace_repl_wrprotect(nid, addr, pte_pfn(pte));
 			ptep_set_wrprotect(mm, addr, ptep);
 			flush = true;
 		}
-		pte_unmap(ptep);
 	}
 	if (flush)
 		flush_tlb_page(vma, addr);
@@ -1024,36 +1022,27 @@ void repl_migrate_start(struct vm_area_struct *vma, unsigned long addr,
 	repl_migrate_unshare(vma, addr, ptep_get(mainp));
 }
 
-/* main lives on its new page: its sharers follow it, the replica on its node is redundant */
+/* main lives on its new page: remote sharers follow it, a local one copies on its next read */
 pte_t repl_migrate_done(struct vm_area_struct *vma, unsigned long addr,
 			pte_t pte, unsigned long old_pfn, bool writable)
 {
 	struct mm_struct *mm = vma->vm_mm;
-	int nid, dst = pfn_to_nid(pte_pfn(pte));
-	pgd_t *repl_pgd;
-	pte_t *ptep;
+	int nid, src = pfn_to_nid(old_pfn), dst = pfn_to_nid(pte_pfn(pte));
+	pte_t *ptep, old;
 
 	trace_repl_migrate_done(addr, old_pfn, pte_pfn(pte));
-	for_each_repl_pgd(mm, nid, repl_pgd) {
-		if (repl_pgd == mm->pgd)
-			continue;
-
-		if (nid == dst) {
-			repl_drop(vma, nid, addr, old_pfn);
-			continue;
-		}
-
-		ptep = repl_pte_map(mm, repl_pgd, addr);
-		if (!ptep)
-			continue;
-		if (pte_present(ptep_get(ptep)) &&
-		    pte_pfn(ptep_get(ptep)) == old_pfn) {
+	if (!writable)
+		pte = pte_wrprotect(pte);
+	for_each_repl_pte(mm, addr, mm->pgd, nid, ptep) {
+		old = ptep_get(ptep);
+		if (pte_present(old) && pte_pfn(old) == old_pfn && nid != src) {
 			ptep_clear_flush(vma, addr, ptep);
-			set_pte_at(mm, addr, ptep, pte_wrprotect(pte));
+			set_pte_at(mm, addr, ptep, pte);
+		} else if (nid == dst || nid == src) {
+			repl_drop_pte(vma, nid, addr, ptep, old_pfn);
 		}
-		pte_unmap(ptep);
 	}
-	return writable ? pte : pte_wrprotect(pte);
+	return pte;
 }
 
 /* replicas are cleaned too: their next write faults and redirties the folio */
@@ -1062,26 +1051,19 @@ void repl_mkclean_main(struct vm_area_struct *vma, unsigned long addr,
 {
 	struct mm_struct *mm = vma->vm_mm;
 	pte_t main, *ptep, pte;
-	pgd_t *repl_pgd;
 	int nid;
 
 	main = ptep_get(mainp);
 	trace_repl_mkclean(mm->repl->main_nid, addr, pte_pfn(main));
 
 	repl_sync_main(vma, addr, mainp);
-	for_each_repl_pgd(mm, nid, repl_pgd) {
-		if (repl_pgd == mm->pgd)
-			continue;
-		ptep = repl_pte_map(mm, repl_pgd, addr);
-		if (!ptep)
-			continue;
+	for_each_repl_pte(mm, addr, mm->pgd, nid, ptep) {
 		pte = ptep_get(ptep);
 		if (pte_present(pte) && (pte_write(pte) || pte_dirty(pte))) {
 			pte = ptep_clear_flush(vma, addr, ptep);
 			set_pte_at(mm, addr, ptep,
 				   pte_mkclean(pte_wrprotect(pte)));
 		}
-		pte_unmap(ptep);
 	}
 }
 
@@ -1092,23 +1074,15 @@ bool repl_replicas_young(struct vm_area_struct *vma, unsigned long addr,
 	struct mm_struct *mm = vma->vm_mm;
 	unsigned long start = addr;
 	bool young = false;
-	pgd_t *repl_pgd;
 	unsigned int i;
 	pte_t *ptep;
 	int nid;
 
 	for (i = 0; i < nr; i++, addr += PAGE_SIZE) {
-		for_each_repl_pgd(mm, nid, repl_pgd) {
-			if (repl_pgd == mm->pgd)
-				continue;
-			ptep = repl_pte_map(mm, repl_pgd, addr);
-			if (!ptep)
-				continue;
+		for_each_repl_pte(mm, addr, mm->pgd, nid, ptep)
 			if (pte_present(ptep_get(ptep)))
 				young |= ptep_test_and_clear_young(vma, addr,
 								   ptep);
-			pte_unmap(ptep);
-		}
 	}
 	if (young)
 		trace_repl_referenced(mm->repl->main_nid, start,
@@ -1174,13 +1148,35 @@ int repl_test_clear_replica_young(struct vm_area_struct *vma,
 
 static struct folio *repl_move_alloc(struct folio *src, unsigned long nid)
 {
-	gfp_t gfp = (GFP_HIGHUSER_MOVABLE & ~__GFP_RECLAIM) | __GFP_THISNODE |
-		    __GFP_NOWARN | __GFP_NOMEMALLOC;
-
 	/* spread: the node interleave gives this file offset */
 	if (nid == NUMA_NO_NODE)
 		nid = repl_nth_node(src->index >> folio_order(src));
-	return __folio_alloc_node(gfp, folio_order(src), nid);
+	return __folio_alloc_node(REPL_GFP | __GFP_NOMEMALLOC, folio_order(src),
+				  nid);
+}
+
+static struct folio *repl_misplaced_main(struct vm_area_struct *vma,
+					 unsigned long addr, pte_t main)
+{
+	struct folio *folio = vm_normal_folio(vma, addr, main);
+
+	if (!folio || folio_nid(folio) ==
+		      repl_interleave_nid(vma, addr, folio_order(folio)))
+		return NULL;
+	folio_get(folio);
+	return folio;
+}
+
+/* off the pte lock: main to @nid, NUMA_NO_NODE spreads it. Takes the reference */
+static void repl_move_main(struct folio *folio, int nid, enum migrate_mode mode)
+{
+	LIST_HEAD(list);
+	bool isolated = repl_isolate(folio, &list);
+
+	folio_put(folio); /* isolation holds main now */
+	if (isolated && migrate_pages(&list, repl_move_alloc, NULL, nid, mode,
+				      MR_NUMA_MISPLACED, NULL))
+		putback_movable_pages(&list);
 }
 
 /* reclaim moves main: the scanned folio itself, or main of a scanned replica */
@@ -1191,16 +1187,11 @@ bool repl_migrate_misplaced(struct folio *folio, struct repl_move *repl_move,
 
 	/* a replica on main's home: main migrates here, replica get thus reclaimed */
 	if (repl_move->main_folio != folio) {
-		if (keep) {
+		if (keep)
 			folio_put(repl_move->main_folio);
-			return false;
-		}
-		repl_isolate(repl_move->main_folio, &list);
-		folio_put(repl_move->main_folio); /* isolation holds main now */
-		if (!list_empty(&list) &&
-		    migrate_pages(&list, repl_move_alloc, NULL, repl_move->nid,
-				  MIGRATE_ASYNC, MR_NUMA_MISPLACED, NULL))
-			putback_movable_pages(&list);
+		else
+			repl_move_main(repl_move->main_folio, repl_move->nid,
+				       MIGRATE_ASYNC);
 		return false;
 	}
 
@@ -1221,16 +1212,13 @@ void repl_unmap_main(struct vm_area_struct *vma, unsigned long addr,
 		     pte_t *mainp)
 {
 	struct mm_struct *mm = vma->vm_mm;
-	pte_t main = ptep_get(mainp);
-	pgd_t *repl_pgd;
+	pte_t main = ptep_get(mainp), *ptep;
 	int nid;
 
 	trace_repl_unmap_main(mm->repl->main_nid, addr, pte_pfn(main));
-	repl_snapshot_size(mm);
 	repl_sync_main(vma, addr, mainp);
-	for_each_repl_pgd(mm, nid, repl_pgd)
-		if (repl_pgd != mm->pgd)
-			repl_drop(vma, nid, addr, pte_pfn(main));
+	for_each_repl_pte(mm, addr, mm->pgd, nid, ptep)
+		repl_drop_pte(vma, nid, addr, ptep, pte_pfn(main));
 }
 
 /* reclaim of a replica: main takes its last write first */
@@ -1251,7 +1239,6 @@ bool repl_unmap_replica(struct vm_area_struct *vma, unsigned long addr,
 	if (replica) {
 		trace_repl_unmap_replica(folio_nid(folio), addr,
 					 folio_pfn(folio));
-		repl_snapshot_size(mm);
 		repl_sync_main(vma, addr, mainp);
 		repl_drop(vma, folio_nid(folio), addr, pte_pfn(main));
 	}
@@ -1279,6 +1266,7 @@ static bool repl_invalidate_one(struct folio *folio, struct vm_area_struct *vma,
 				unsigned long addr, void *arg)
 {
 	DEFINE_FOLIO_VMA_WALK(pvmw, folio, vma, addr, 0);
+	u64 start = ktime_get_ns();
 
 	while (page_vma_mapped_walk(&pvmw)) {
 		trace_repl_written(vma->vm_mm->repl->main_nid, pvmw.address,
@@ -1286,6 +1274,7 @@ static bool repl_invalidate_one(struct folio *folio, struct vm_area_struct *vma,
 		repl_invalidate(vma, vma->vm_mm->pgd, pvmw.address,
 				pte_pfn(ptep_get(pvmw.pte)));
 	}
+	repl_cost_add(vma->vm_mm, start);
 	return true;
 }
 
@@ -1328,12 +1317,13 @@ static vm_fault_t repl_handle_pte_fault(struct vm_area_struct *vma, pgd_t *pgd,
 {
 	bool write = flags & FAULT_FLAG_WRITE, held;
 	struct mm_struct *mm = vma->vm_mm;
-	struct folio *wp_folio = NULL;
+	struct folio *wp_folio = NULL, *misplaced = NULL;
+	bool share = false, coherent = false;
 	pte_t *mainp, *ptep, main;
 	struct page *page;
 	spinlock_t *ptl;
 	vm_fault_t ret = 0;
-	u64 start;
+	u64 start = ktime_get_ns(); /* waiting on main's lock is coherence too */
 
 	mainp = repl_pte_map_lock(mm, mm->pgd, addr, &ptl);
 	if (!mainp)
@@ -1346,7 +1336,6 @@ static vm_fault_t repl_handle_pte_fault(struct vm_area_struct *vma, pgd_t *pgd,
 	if (write && (vma->vm_flags & VM_SHARED) && page) {
 		wp_folio = page_folio(page);
 		if (!repl_folio_lock_dirty(wp_folio, &held)) {
-			start = ktime_get_ns();
 			folio_get(wp_folio);
 			pte_unmap_unlock(mainp, ptl);
 			ret = repl_page_mkwrite(vma, addr, flags, page);
@@ -1362,22 +1351,32 @@ static vm_fault_t repl_handle_pte_fault(struct vm_area_struct *vma, pgd_t *pgd,
 	if (!ptep)
 		goto unlock; /* freed meanwhile: refault */
 
+	if (write && repl_write_costly(mm, addr, ptep_get(ptep), main)) {
+		share = true;
+		misplaced = repl_misplaced_main(vma, addr, main);
+	}
 	if (pte_none(ptep_get(ptep)))
-		repl_install_replica(vma, addr, mainp, ptep, write,
+		repl_install_replica(vma, addr, mainp, ptep, share,
 				     prealloc_folio);
-	if (repl_write_costly(mm, ptep_get(ptep)))
+	if (share)
 		repl_unreplicate(vma, addr, mainp);
-	if (repl_pte_rdprotected(ptep_get(ptep)))
+	if (repl_pte_rdprotected(ptep_get(ptep))) {
 		repl_handle_rdprotect(vma, pgd, addr, ptep);
+		coherent = true;
+	}
 	if (write)
-		repl_handle_write(vma, pgd, addr, ptep);
-
+		coherent |= repl_handle_write(vma, pgd, addr, ptep);
 	if (ptep != mainp)
 		pte_unmap(ptep);
 unlock:
 	if (wp_folio)
 		folio_unlock(wp_folio);
 	pte_unmap_unlock(mainp, ptl);
+	/* a share is counted where it syncs main */
+	if (coherent && !share)
+		repl_cost_add(mm, start);
+	if (misplaced)
+		repl_move_main(misplaced, NUMA_NO_NODE, MIGRATE_SYNC);
 	return ret;
 }
 
@@ -1427,18 +1426,19 @@ vm_fault_t repl_handle_mm_fault(struct vm_area_struct *vma, unsigned long addr,
 	return ret;
 }
 
-static int repl_walk_window(struct mm_struct *mm, unsigned long start,
-			    const struct mm_walk_ops *ops, void *private)
+static int repl_walk_window(struct mm_struct *mm, const struct mm_walk_ops *ops,
+			    void *private)
 {
+	unsigned long w = mm->repl->window;
 	int ret;
+
 	mmap_read_lock(mm);
-	ret = walk_page_range(mm, start, mm->repl->window + PGDIR_SIZE, ops,
-			      private);
+	ret = walk_page_range(mm, w, w + PGDIR_SIZE, ops, private);
 	mmap_read_unlock(mm);
 	return ret;
 }
 
-/* main off its node is isolated: interleave's while shared, home otherwise */
+/* main off its node is isolated */
 static int repl_isolate_main(pte_t *mainp, unsigned long addr,
 			     unsigned long next, struct mm_walk *walk)
 {
@@ -1451,8 +1451,6 @@ static int repl_isolate_main(pte_t *mainp, unsigned long addr,
 		folio = vm_normal_folio(walk->vma, addr, main);
 	if (!folio)
 		return 0;
-	if (READ_ONCE(walk->mm->repl->state) != REPL_REPLICATED)
-		nid = repl_interleave_nid(walk->vma, addr, folio_order(folio));
 	if (folio_nid(folio) != nid && repl_isolate(folio, &m->list))
 		m->budget -= folio_nr_pages(folio);
 	return m->budget <= 0;
@@ -1466,21 +1464,20 @@ static const struct mm_walk_ops repl_main_ops = {
 /* every main to its node, or as many as *budget allows: true once all are */
 static bool repl_move_mains(struct mm_struct *mm, long *budget)
 {
-	bool spread = READ_ONCE(mm->repl->state) != REPL_REPLICATED;
 	int placement = READ_ONCE(repl_main_placement);
 	unsigned int moved = 0;
 	struct repl_mains m = { .budget = budget ? *budget : LONG_MAX };
 	bool all;
 
-	if (!spread && placement != REPL_MAIN_BOUND &&
+	if (placement != REPL_MAIN_BOUND &&
 	    placement != REPL_MAIN_DYNAMIC)
 		return true; /* no home: mains stay where the placement put them */
 
 	INIT_LIST_HEAD(&m.list);
 	lru_add_drain_all(); /* recent folios onto the LRU, to be isolated */
-	all = !repl_walk_window(mm, mm->repl->window, &repl_main_ops, &m);
+	all = !repl_walk_window(mm, &repl_main_ops, &m);
 	if (migrate_pages(&m.list, repl_move_alloc, NULL,
-			  spread ? NUMA_NO_NODE : mm->repl->main_nid,
+			  mm->repl->main_nid,
 			  MIGRATE_SYNC, MR_NUMA_MISPLACED, &moved)) {
 		putback_movable_pages(&m.list);
 		all = false;
@@ -1493,131 +1490,97 @@ static bool repl_move_mains(struct mm_struct *mm, long *budget)
 
 /* remote sharers of main go: the next read on their node copies */
 static long repl_unshare_page(struct vm_area_struct *vma, unsigned long addr,
-			      unsigned long pfn)
+			      pte_t *mainp)
 {
 	struct mm_struct *mm = vma->vm_mm;
-	pgd_t *repl_pgd;
-	pte_t *ptep, pte;
+	pte_t *ptep, pte, main = ptep_get(mainp);
+	unsigned long pfn = pte_pfn(main);
+	bool uptodate = false;
 	long dropped = 0;
 	int nid;
 
-	for_each_repl_pgd(mm, nid, repl_pgd) {
-		if (repl_pgd == mm->pgd || nid == pfn_to_nid(pfn))
-			continue;
-		ptep = repl_pte_map(mm, repl_pgd, addr);
-		if (!ptep)
-			continue;
+	for_each_repl_pte(mm, addr, mm->pgd, nid, ptep) {
 		pte = ptep_get(ptep);
-		if (pte_present(pte) && pte_pfn(pte) == pfn) {
-			trace_repl_unshare(nid, addr, pfn);
-			if (pte_dirty(ptep_get_and_clear(mm, addr, ptep)))
-				folio_mark_dirty(pfn_folio(pfn));
-			dropped++;
-		}
-		pte_unmap(ptep);
+		if (!(nid != pfn_to_nid(pfn) && pte_present(pte) &&
+		      pte_pfn(pte) == pfn))
+			continue;
+		trace_repl_unshare(nid, addr, pfn);
+		uptodate |= repl_pte_uptodate(pte);
+		if (pte_dirty(ptep_get_and_clear(mm, addr, ptep)))
+			folio_mark_dirty(pfn_folio(pfn));
+		dropped++;
 	}
+	/* a dropped sharer kept main's page up to date: main's pte says so */
+	if (uptodate && repl_pte_rdprotected(main))
+		set_pte_at(mm, addr, mainp,
+			   pte_wrprotect(repl_pte_rdunprotect(main, vma)));
 
 	return dropped;
 }
 
-static int repl_unshare_pte(pte_t *mainp, unsigned long addr,
-			    unsigned long next, struct mm_walk *walk)
+/* a table of mains under its lock: flushed before a dropped sharer can write */
+static int repl_unshare_pmd(pmd_t *pmd, unsigned long addr, unsigned long end,
+			    struct mm_walk *walk)
 {
-	long *budget = walk->private;
-	pte_t main = ptep_get(mainp);
+	long *budget = walk->private, dropped = 0;
+	unsigned long start = addr;
+	pte_t *table, *mainp, main;
+	spinlock_t *ptl;
 
-	if (pte_present(main) && vm_normal_page(walk->vma, addr, main))
-		*budget -= repl_unshare_page(walk->vma, addr, pte_pfn(main));
+	table = pte_offset_map_lock(walk->mm, pmd, addr, &ptl);
+	if (!table)
+		return 0;
+	for (mainp = table; addr < end && dropped < *budget;
+	     addr += PAGE_SIZE, mainp++) {
+		main = ptep_get(mainp);
+		if (pte_present(main) && vm_normal_page(walk->vma, addr, main))
+			dropped += repl_unshare_page(walk->vma, addr, mainp);
+	}
+	if (dropped)
+		flush_tlb_range(walk->vma, start, end);
+	pte_unmap_unlock(table, ptl);
+	*budget -= dropped;
 	return *budget <= 0;
 }
 
 static const struct mm_walk_ops repl_unshare_ops = {
-	.pte_entry = repl_unshare_pte,
+	.pmd_entry = repl_unshare_pmd,
 	.walk_lock = PGWALK_RDLOCK,
 };
 
-/* sharers go, as many as memory can copy back, one flush for all */
-static bool repl_unshare_all(struct mm_struct *mm, long budget)
+/* sharers go, as many as memory can copy back */
+static bool repl_unshare(struct mm_struct *mm, long budget)
 {
-	bool all;
-
-	if (budget <= 0)
-		return false;
-	all = !repl_walk_window(mm, mm->repl->window, &repl_unshare_ops,
-				&budget);
-	flush_tlb_mm(mm);
-	return all;
-}
-
-/* shared pages read 2x slower: their reads may cost what coherence does */
-static void repl_budget_grow(struct mm_repl *r, unsigned long pages,
-			     unsigned int cost)
-{
-	if (cost < 100)
-		WRITE_ONCE(r->budget,
-			   max(r->budget, pages * cost / (100 - cost)));
-}
-
-static void repl_retry(struct mm_struct *mm)
-{
-	repl_unshare_all(mm, repl_room(mm));
-	atomic_long_set(&mm->repl->spent, 0);
-	WRITE_ONCE(mm->repl->budget, 0);
+	return budget > 0 && !repl_walk_window(mm, &repl_unshare_ops, &budget);
 }
 
 /* main back home first, then the sharers that would read it remotely go */
 static void repl_restore(struct mm_struct *mm)
 {
-	unsigned long w = mm->repl->window;
 	long budget = repl_room(mm);
 	long share = budget / nodes_weight(mm->repl->nodes), left = share;
 	bool all;
 
-	if (!w)
+	if (!mm->repl->window)
 		return;
-	trace_repl_restore(mm->repl->main_nid, mm->repl->size, get_mm_rss(mm));
-	/* cleared first: a fault degrading again meanwhile sets it back */
+	trace_repl_restore(mm->repl->main_nid, get_mm_rss(mm));
 	WRITE_ONCE(mm->repl->degraded, false);
 
-	/* main's node gets its share of the room, like each other node */
 	all = repl_move_mains(mm, &left);
 	budget -= share - left;
-	/* restored once both are done, else the next pass goes on */
-	if (!repl_unshare_all(mm, budget) || !all)
+	if (!repl_unshare(mm, budget) || !all)
 		WRITE_ONCE(mm->repl->degraded, true);
-
-	/* a partial restore keeps the footprint for the next one */
-	if (!READ_ONCE(mm->repl->degraded))
-		WRITE_ONCE(mm->repl->size, 0);
 }
 
-/* coherence time since the last tick, in percent of the cpu time */
-static unsigned int repl_cost(struct mm_struct *mm, struct task_struct *p)
+/* coherence and cpu time since the last tick */
+static u64 repl_cost(struct mm_struct *mm, struct task_struct *p, u64 *cpu_ns)
 {
-	u64 cost_ns = atomic64_xchg(&mm->repl->cost_ns, 0), cpu_ns;
 	struct task_cputime ct;
-	unsigned int cost;
 
 	thread_group_cputime(p, &ct);
-	cpu_ns = ct.sum_exec_runtime - mm->repl->cpu_ns;
+	*cpu_ns = ct.sum_exec_runtime - mm->repl->cpu_ns;
 	mm->repl->cpu_ns = ct.sum_exec_runtime;
-	cost = cpu_ns ? min_t(u64, div64_u64(cost_ns * 100, cpu_ns), 100) : 0;
-	return cost;
-}
-
-/* a new state counts its seconds from 0 */
-static void repl_enter(struct mm_repl *r, enum repl_state state)
-{
-	WRITE_ONCE(r->state, state);
-	r->ticks = 0;
-}
-
-/* reads 2x faster can afford to lose half the time to coherence */
-static unsigned int repl_cost_threshold(void)
-{
-	unsigned int s = READ_ONCE(repl_read_speedup);
-
-	return s > 100 ? 100 - 10000 / s : 0;
+	return min_t(u64, atomic64_xchg(&mm->repl->cost_ns, 0), *cpu_ns);
 }
 
 /* an interval of 0 turns its pass off */
@@ -1626,62 +1589,84 @@ static bool repl_due(unsigned long tick, unsigned int interval)
 	return interval && !(tick % interval);
 }
 
-/*
- * Replicated: written pages share within the budget, all back every retry;
- * over threshold SHARE_TICKS in a row -> shared, mains spread.
- * Shared: after write_retry_interval -> trial, copies back, mains still spread.
- * Trial: over threshold once -> shared; HOME_TICKS under -> replicated, mains home.
- */
-static void repl_balance(struct mm_struct *mm, unsigned int cost)
+/* a budget: no page shares until every page should, or every page shares */
+#define REPL_HELD	(-1L)
+#define REPL_ALL	LONG_MAX
+
+/* pages worth sharing: coherence time over what a shared page loses in reads */
+static long repl_budget(struct mm_struct *mm, u64 cost_ns, u64 cpu_ns)
 {
-	unsigned int retry = READ_ONCE(repl_write_retry_interval);
-	unsigned int threshold = repl_cost_threshold();
-	unsigned int nodes = num_online_nodes();
+	u64 penalty_ns = (cpu_ns - cost_ns) * READ_ONCE(repl_read_penalty) / 100;
+	u64 pages = get_mm_rss(mm) / nodes_weight(mm->repl->nodes);
+	long sample = mm->repl->sample, budget;
+
+	if (!(READ_ONCE(repl_write_unreplication) && cost_ns && pages))
+		return 0;
+	if (cost_ns >= penalty_ns)
+		return REPL_ALL;
+	budget = cost_ns / max(penalty_ns / pages, 1);
+	return sample && budget >= sample ? REPL_ALL : budget;
+}
+
+/* reads lost to shared pages now cost more than the coherence they saved */
+static bool repl_share_failed(struct mm_repl *r, long budget)
+{
+	long before = r->budget;
+
+	if (before <= 0 || before == REPL_ALL || budget > before)
+		return false;
+	return atomic_long_read(&r->spent) + budget > before;
+}
+
+/* every interval, or at once when unreplication is turned off */
+static bool repl_retry_due(struct mm_repl *r)
+{
+	unsigned int interval = READ_ONCE(repl_write_retry_interval);
+
+	if (r->budget && !READ_ONCE(repl_write_unreplication))
+		return true;
+	if (!interval || ++r->ticks < interval)
+		return false;
+	r->ticks = 0;
+	return true;
+}
+
+/* shared pages copied back: a sample if every page shared, else all of them */
+static void repl_retry(struct mm_struct *mm, long budget)
+{
+	struct mm_repl *r = mm->repl;
+	long room = repl_room(mm);
+
+	r->sample = r->budget == REPL_ALL && READ_ONCE(repl_write_unreplication) ?
+			    atomic_long_read(&r->spent) / 16 : 0;
+	WRITE_ONCE(r->budget, budget);
+	if (!atomic_long_xchg(&r->spent, 0))
+		return;
+	if (r->sample)
+		room = min(r->sample * (nodes_weight(r->nodes) - 1), room);
+	repl_unshare(mm, room);
+}
+
+/* a budget counts once it held two ticks; once held, only every page */
+static void repl_update_budget(struct mm_repl *r, long budget)
+{
+	long held = min(budget, r->last);
+
+	if (r->budget != REPL_HELD || held == REPL_ALL)
+		WRITE_ONCE(r->budget, max(r->budget, held));
+	if (r->budget == REPL_ALL || r->ticks > 2)
+		r->sample = 0;
+}
+
+/* copies come back once no write shares a page and no retry relearns */
+static bool repl_restorable(struct mm_struct *mm)
+{
+	unsigned int interval = READ_ONCE(repl_write_retry_interval);
 	struct mm_repl *r = mm->repl;
 
-	if (!(READ_ONCE(repl_write_unreplication) && r->window)) {
-		/* policy off: back to replicated, mains home, then copies */
-		if (r->state != REPL_REPLICATED) {
-			repl_enter(r, REPL_REPLICATED);
-			if (r->window) {
-				repl_move_mains(mm, NULL);
-				repl_unshare_all(mm, repl_room(mm));
-			}
-		}
-		return;
-	}
-
-	r->ticks++;
-	r->clock++;
-	repl_budget_grow(r, get_mm_rss(mm), cost);
-
-	switch (r->state) {
-	case REPL_REPLICATED:
-		if (repl_due(r->clock, retry))
-			repl_retry(mm);
-		if (cost <= threshold) {
-			r->ticks = 0;
-		} else if (r->ticks == REPL_SHARE_TICKS) {
-			repl_enter(r, REPL_SHARED);
-			repl_move_mains(mm, NULL);
-		}
-		break;
-	case REPL_SHARED:
-		if (retry && r->ticks >= retry) {
-			repl_retry(mm);
-			repl_enter(r, REPL_TRIAL);
-		}
-		break;
-	case REPL_TRIAL:
-		/* mains home: n/(n-1) as many copies */
-		if (cost * nodes / (nodes - 1) > threshold) {
-			repl_enter(r, REPL_SHARED);
-		} else if (r->ticks >= REPL_HOME_TICKS) {
-			repl_enter(r, REPL_REPLICATED);
-			repl_move_mains(mm, NULL);
-		}
-		break;
-	}
+	return READ_ONCE(r->degraded) && (!interval || r->ticks >= min(interval - 1, 3U)) &&
+	       r->budget != REPL_ALL && !r->sample && !atomic_long_read(&r->spent) &&
+	       repl_room(mm) > 0;
 }
 
 /* the next process from pid *nr krepld has work for, its task and mm held */
@@ -1699,10 +1684,7 @@ static struct mm_struct *repl_next_mm(int *nr, struct task_struct **taskp)
 			continue;
 		task_lock(p);
 		mm = p->mm;
-		if (mm && repl_has_pgds(mm) &&
-		    (READ_ONCE(mm->repl->degraded) ||
-		     READ_ONCE(mm->repl->state) != REPL_REPLICATED ||
-		     (READ_ONCE(repl_write_unreplication) && mm->repl->window)))
+		if (mm && repl_has_pgds(mm) && mm->repl->window)
 			mmget(mm);
 		else
 			mm = NULL;
@@ -1714,28 +1696,45 @@ static struct mm_struct *repl_next_mm(int *nr, struct task_struct **taskp)
 	return mm;
 }
 
+/* one process, one tick */
+static void repl_tick(struct mm_struct *mm, struct task_struct *p,
+		      unsigned long tick)
+{
+	struct mm_repl *r = mm->repl;
+	u64 cpu_ns, cost_ns = repl_cost(mm, p, &cpu_ns);
+	long budget = repl_budget(mm, cost_ns, cpu_ns);
+	bool failed = repl_share_failed(r, budget);
+
+	if (repl_retry_due(r)) {
+		repl_retry(mm, 0);
+	} else if (failed && r->share_failed) {
+		repl_retry(mm, REPL_HELD);
+	} else {
+		repl_update_budget(r, budget);
+		if (repl_due(tick, READ_ONCE(repl_restore_interval)) &&
+		    repl_restorable(mm))
+			repl_restore(mm);
+	}
+	r->share_failed = failed;
+	r->last = r->sample ? REPL_ALL : budget;
+	trace_repl_cost(cpu_ns ? div64_u64(cost_ns * 100, cpu_ns) : 0,
+			atomic_long_read(&r->spent), r->budget);
+}
+
 static int repl_restored(void *unused)
 {
 	unsigned long tick = 0;
 	struct task_struct *p;
 	struct mm_struct *mm;
 	int nr;
-	unsigned int cost;
 
 	while (!kthread_should_stop()) {
 		schedule_timeout_idle(HZ);
 		tick++;
 		/* every process each tick: one must not hide the others */
 		for (nr = 1; (mm = repl_next_mm(&nr, &p)); mmput(mm)) {
-			cost = repl_cost(mm, p);
+			repl_tick(mm, p, tick);
 			put_task_struct(p);
-			repl_balance(mm, cost);
-			trace_repl_cost(cost, READ_ONCE(mm->repl->state));
-			if (repl_due(tick, READ_ONCE(repl_restore_interval)) &&
-			    READ_ONCE(mm->repl->degraded) &&
-			    READ_ONCE(mm->repl->state) == REPL_REPLICATED &&
-			    repl_room(mm) > 0)
-				repl_restore(mm);
 		}
 	}
 
@@ -1775,15 +1774,12 @@ static void repl_stat_range(struct mm_struct *mm, unsigned long addr,
 	pte_t *ptes[REPL_MAX_NODES], pte, main;
 	struct repl_stat *s;
 	unsigned long next, i, pfn;
-	pmd_t *pmd;
 	pgd_t *pgd;
 
 	for (; addr < end; addr = next) {
 		next = pmd_addr_end(addr, end);
-		for_each_repl_pgd(mm, nid, pgd) {
-			pmd = repl_pmd_find(mm, pgd, addr);
-			ptes[nid] = pmd ? pte_offset_map(pmd, addr) : NULL;
-		}
+		for_each_repl_pgd(mm, nid, pgd)
+			ptes[nid] = repl_pte_map(mm, pgd, addr);
 		for (i = 0; i < (next - addr) >> PAGE_SHIFT; i++) {
 			main = ptes[main_nid] ? ptep_get(ptes[main_nid] + i) :
 						__pte(0);
@@ -1836,7 +1832,8 @@ static void repl_stat_print(struct seq_file *m, struct mm_struct *mm,
 	char copies[16];
 	pgd_t *pgd;
 
-	seq_printf(m, "state: %s\n", states[READ_ONCE(mm->repl->state)]);
+	seq_printf(m, "write budget: %ld/%ld\n",
+		   atomic_long_read(&mm->repl->spent), mm->repl->budget);
 	seq_puts(m, "main folios:");
 	for (i = 0; i < NR_PAGE_ORDERS; i++) {
 		if (!st->orders[i])
@@ -1976,16 +1973,15 @@ static struct kobj_attribute files_attr = __ATTR_RW(files);
 REPL_ATTR(free_percent, 100);
 REPL_ATTR(restore_interval, UINT_MAX);
 REPL_ATTR(write_unreplication, 1);
-REPL_ATTR(read_speedup, 10000);
+REPL_ATTR(read_penalty, 10000);
 REPL_ATTR(write_retry_interval, UINT_MAX);
-REPL_ATTR(write_budget, 1);
 
 static struct attribute *repl_attrs[] = {
 	&restore_attr.attr,	 &main_placement_attr.attr,
 	&free_percent_attr.attr, &restore_interval_attr.attr,
 	&files_attr.attr,	 &write_unreplication_attr.attr,
-	&read_speedup_attr.attr, &write_retry_interval_attr.attr,
-	&write_budget_attr.attr, NULL,
+	&read_penalty_attr.attr, &write_retry_interval_attr.attr,
+	NULL,
 };
 static const struct attribute_group repl_attr_group = {
 	.name = "numa_replication",

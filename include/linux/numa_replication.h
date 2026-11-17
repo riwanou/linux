@@ -17,22 +17,24 @@ struct repl_move {
 	bool pressure;
 };
 
-enum repl_state { REPL_REPLICATED, REPL_SHARED, REPL_TRIAL };
-
 struct mm_repl {
 	nodemask_t nodes;
 	pgd_t *pgds[REPL_MAX_NODES];
 	int main_nid;
 	unsigned long window; /* 512GB, 1 PGD */
-	bool degraded;
-	unsigned long size; /* rss before the pressure */
+	bool degraded; /* locality lost: restore has work */
+
+	/* write unreplication: what copies cost, measured each tick */
 	atomic64_t cost_ns; /* coherence time this tick */
 	u64 cpu_ns; /* cpu time at the last tick */
-	u8 state; /* replicated, shared or trial */
-	unsigned int ticks; /* seconds in this state */
-	unsigned int clock;
-	atomic_long_t spent;
-	unsigned long budget; /* pages that may stop being replicated */
+	long last; /* budget the last tick measured */
+
+	/* pages writes may share, held until the next retry */
+	long budget; /* REPL_HELD after a failed share, REPL_ALL every page */
+	atomic_long_t spent; /* pages shared since the last retry */
+	bool share_failed; /* the last tick found sharing did not pay */
+	unsigned int ticks; /* since the last retry */
+	long sample; /* pages a retry copied back out of every page shared */
 };
 
 #ifdef CONFIG_NUMA_REPL

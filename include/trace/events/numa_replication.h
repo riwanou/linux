@@ -105,36 +105,34 @@ DEFINE_EVENT(repl_move, repl_migrate_done,
 	TP_ARGS(addr, src, dst));
 
 TRACE_EVENT(repl_restore,
-	TP_PROTO(int node, unsigned long size, unsigned long rss),
-	TP_ARGS(node, size, rss),
+	TP_PROTO(int node, unsigned long rss),
+	TP_ARGS(node, rss),
 	TP_STRUCT__entry(
 		__field(int, node)
-		__field(unsigned long, size)
 		__field(unsigned long, rss)
 	),
 	TP_fast_assign(
 		__entry->node = node;
-		__entry->size = size;
 		__entry->rss = rss;
 	),
-	TP_printk("n%d size %lu rss %lu", __entry->node, __entry->size,
-		  __entry->rss)
+	TP_printk("n%d rss %lu", __entry->node, __entry->rss)
 );
 
 TRACE_EVENT(repl_cost,
-	TP_PROTO(unsigned int cost, u8 state),
-	TP_ARGS(cost, state),
+	TP_PROTO(unsigned int cost, long spent, long budget),
+	TP_ARGS(cost, spent, budget),
 	TP_STRUCT__entry(
 		__field(unsigned int, cost)
-		__field(u8, state)
+		__field(long, spent)
+		__field(long, budget)
 	),
 	TP_fast_assign(
 		__entry->cost = cost;
-		__entry->state = state;
+		__entry->spent = spent;
+		__entry->budget = budget;
 	),
-	TP_printk("cost %u%% %s", __entry->cost,
-		  __print_symbolic(__entry->state, { REPL_REPLICATED, "replicated" },
-				   { REPL_SHARED, "shared" }, { REPL_TRIAL, "trial" }))
+	TP_printk("cost %u%% write budget %ld/%ld", __entry->cost,
+		  __entry->spent, __entry->budget)
 );
 
 /* clang-format on */
